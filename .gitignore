@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Wrangler local state (may contain deploy metadata — never commit)
+.wrangler/
+
+# Secrets — this repo is secret-free by rule; these never exist here anyway
+.dev.vars
+.env
+.env.*
+
+# Noise
+*.log
+.DS_Store
