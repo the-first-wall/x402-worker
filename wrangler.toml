@@ -1,0 +1,34 @@
+# The First Wall — x402 discovery shim
+# =====================================
+# Deliberately contains NO account-specific identifiers (no account_id, no
+# zone_id, no routes bound to a zone). The operator's Cloudflare account
+# supplies those at deploy time — see README.md "Operator TODO".
+#
+# This worker is STATELESS and CUSTODY-FREE: no KV, no D1, no queues, no
+# secrets, no bindings other than the public read-only config below.
+
+name = "thefirstwall-x402"
+main = "index.js"
+compatibility_date = "2026-10-01"
+
+# Public, secret-free configuration. All values are safe to commit.
+[vars]
+# Read-only Base mainnet JSON-RPC. Public default; swap for your own
+# Alchemy/QuickNode/Cloudflare-free endpoint if rate-limited. Fallback
+# endpoints (publicnode, 1rpc) are hardcoded in index.js rpcUrls().
+RPC_URL = "https://mainnet.base.org"
+# Live ledger-derived state (static site) — the worker reads `next_available_slot`
+# from here at request time and never stores it.
+STATE_URL = "https://thefirstwall.ai/state.json"
+SITE_URL = "https://thefirstwall.ai"
+# The public URL this shim is served from. MUST match the deployed URL so the
+# x402 `resource.url` and Bazaar metadata are accurate.
+# INTERIM 2026-10-09: thefirstwall.ai is delegated at GoDaddy (ns03/04.domaincontrol.com)
+# and NOT on this Cloudflare account, so the x402.thefirstwall.ai custom domain
+# cannot be pinned yet. Point at the live workers.dev URL until the zone moves,
+# then flip back to https://x402.thefirstwall.ai/claim and pin the domain below.
+RESOURCE_URL = "https://thefirstwall-x402.thefirstwall.workers.dev/claim"
+
+# Operator TODO (after `wrangler login`): pin the custom domain on YOUR account.
+# Uncomment and adjust once the zone is on the deploying account:
+# routes = [{ pattern = "x402.thefirstwall.ai/*", custom_domain = true }]

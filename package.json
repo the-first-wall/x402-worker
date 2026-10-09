@@ -1,0 +1,10 @@
+{
+  "name": "thefirstwall-x402",
+  "private": true,
+  "type": "module",
+  "description": "Stateless, custody-free x402 Bazaar discovery shim for The First Wall",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  }
+}
