@@ -17,8 +17,9 @@ compatibility_date = "2026-10-01"
 # Alchemy/QuickNode/Cloudflare-free endpoint if rate-limited. Fallback
 # endpoints (publicnode, 1rpc) are hardcoded in index.js rpcUrls().
 RPC_URL = "https://mainnet.base.org"
-# Live ledger-derived state (static site) — the worker reads `next_available_slot`
-# from here at request time and never stores it.
+# Live ledger-derived state (static site) — the worker reads `next_available_slot`,
+# `current_floor_usdc` and `pricing_tier` from here at request time (the price it
+# asks for and checks against) and never stores them.
 STATE_URL = "https://thefirstwall.ai/state.json"
 SITE_URL = "https://thefirstwall.ai"
 # The public URL this shim is served from. MUST match the deployed URL so the

@@ -36,7 +36,7 @@ x402-worker/
 
 | Route | Behavior |
 | :-- | :-- |
-| `GET /claim` | `402 Payment Required` + x402 payment requirements (exactly **1.00 USDC**, `eip155:8453` Base mainnet, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, `payTo` `0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23`) and `extensions.bazaar` discovery metadata. |
+| `GET /claim` | `402 Payment Required` + x402 payment requirements (**the ledger's current floor**, read live from `state.json` — 1.00 USDC in the genesis tier — `eip155:8453` Base mainnet, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, `payTo` `0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23`) and `extensions.bazaar` discovery metadata, including `info.price`. |
 | `POST /claim` | Verifies the `X-PAYMENT` (or `PAYMENT-SIGNATURE`) proof **statelessly on Base RPC**, returns the receipt with the live `next_slot`. Also accepts the proof on the retried `GET`, classic x402-style. |
 | `GET /healthz` | `{"ok":true}` |
 | `GET /` | `302` → <https://thefirstwall.ai> |
@@ -60,7 +60,11 @@ x402-worker/
 1. Buyer (or Bazaar `proxy_tool_call`) calls `GET /claim`.
 2. Worker answers `402` with payment requirements (body + `PAYMENT-REQUIRED`
    header, base64 `PaymentRequired`).
-3. Buyer sends **exactly 1.00 USDC on Base** from its own wallet to `payTo`.
+3. Buyer sends **at least the floor named in `accepts[0].amount`** (USDC on Base) from
+   its own wallet to `payTo`. The floor is the ledger's price ladder: the tier price of
+   the next free block (`current_floor_usdc` / `pricing_tier` in `state.json`).
+   Overpayment is accepted; nothing is ever refunded; an unused settlement stays valid
+   for a later claim by the same wallet.
 4. Buyer re-requests `POST /claim` with the settlement proof in `X-PAYMENT`
    (x402 `PaymentPayload` carrying `payload.txHash`, or a bare `0x…` hash).
 5. Worker verifies the settled transfer on-chain (below) and returns:
@@ -95,7 +99,12 @@ plus `PAYMENT-RESPONSE` / `X-PAYMENT-RESPONSE` headers (base64
    (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`) where:
    - `sender` (topic 1) is the payer — this *is* the sender binding;
    - `recipient` (topic 2) == `payTo` (`0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23`);
-   - `amount` (data) **≥ 1.00 USDC** (1,000,000 base units, 6 decimals).
+   - `amount` (data) **≥ the current floor** read from `state.json` at request time
+     (1.00 USDC = 1,000,000 base units in the genesis tier; 3.00 from block #0501, and
+     so on up the ladder). The largest such transfer in the transaction is the
+     settlement. Below the floor is a final (non-retryable) 402 naming both amounts.
+     When `state.json` cannot be read the genesis floor is assumed — the lowest rung,
+     so the shim never demands more than the ledger would.
 4. If the proof declares a payer (`payload.authorization.from` / `payer`), it must
    equal the Transfer sender.
 5. **Finality:** the chain head is read from the agreeing endpoints (the
@@ -271,6 +280,9 @@ Resolved from public docs (x402 Foundation `specs/transports-v2/http.md`,
    discovery info lives in `PaymentRequirements.outputSchema`; its exact expected
    shape is not public. We store the receipt JSON Schema there — harmless if
    ignored, useful if read.
-6. **Amount semantics.** `skill.md` says "exactly `current_floor_usdc`"; this shim
-   accepts **≥ 1.00 USDC** per the task spec (Genesis floor). The ledger verifier
-   remains the authority on exact-amount settlement.
+6. **Amount semantics.** The shim asks for and checks **≥ the current floor** from
+   `state.json`, which is the ledger's price ladder (the tier price of the next free
+   block). The ledger verifier remains the authority: it checks the payment against
+   the tier price of the block the claim is actually assigned, in settlement order
+   among all pending claims, so near a tier boundary an agent is wise to pay the
+   next tier's price. Overpayment is accepted and never refunded.

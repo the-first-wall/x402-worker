@@ -5,14 +5,16 @@
  *
  * What it is:
  *   GET  /claim    -> 402 Payment Required + x402 payment requirements
- *                     (1.00 USDC, Base mainnet eip155:8453) and
- *                     `extensions.bazaar` discovery metadata.
+ *                     (the ledger's current floor read from state.json —
+ *                     1.00 USDC in the genesis tier — Base mainnet
+ *                     eip155:8453) and `extensions.bazaar` discovery metadata.
  *   POST /claim    -> verify the X-PAYMENT (or PAYMENT-SIGNATURE) proof
  *                     STATELESSLY on Base RPC (read-only
  *                     eth_getTransactionReceipt + USDC Transfer log match,
  *                     agreed by a quorum of independent endpoints, at least
- *                     MIN_CONFIRMATIONS deep), then return an ADVISORY
- *                     receipt bound to (tx, next slot, state root, expiry).
+ *                     MIN_CONFIRMATIONS deep, for at least the current floor),
+ *                     then return an ADVISORY receipt bound to (tx, next
+ *                     slot, state root, expiry).
  *   GET  /healthz  -> {"ok":true}
  *   GET  /         -> 302 to https://thefirstwall.ai
  *
@@ -37,8 +39,20 @@ const CHAIN_ID = 8453;
 const NETWORK = "eip155:8453"; // CAIP-2 for Base mainnet
 const USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const PAY_TO = "0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23"; // ADDRESSES.md row 1
-const PRICE_BASE_UNITS = 1000000n; // 1.00 USDC (6 decimals)
-const PRICE_LABEL = "1.00 USDC";
+const USDC_DECIMALS = 6;
+// The ledger's price ladder (spec.json#pricing_tiers): the floor is the tier
+// price of the next free block and is read from state.json at request time
+// (`current_floor_usdc`, `pricing_tier`). When state.json cannot be read the
+// genesis floor is assumed — the lowest rung, so the shim never asks for more
+// than the ledger would. The ledger verifier is the authority: the payment
+// must cover the tier price of the block it is assigned, overpayment is
+// accepted, nothing is refunded.
+const GENESIS_FLOOR_BASE_UNITS = 1000000n; // 1.00 USDC (6 decimals)
+const GENESIS_TIER = "genesis";
+const MAX_SANE_FLOOR_USDC = 10000;
+const PRICE_RULE =
+  "pay at least the current floor (the tier price of the block you are assigned); " +
+  "overpayment is accepted; no refunds; an unused settlement stays valid for a later claim by the same wallet";
 // keccak256("Transfer(address,address,uint256)")
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -115,6 +129,31 @@ function cfgInt(env, key, fallback) {
   const n = parseInt(cfg(env, key, fallback), 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
+function usdcToUnits(usdc) {
+  return BigInt(Math.round(usdc * 10 ** USDC_DECIMALS));
+}
+function unitsToUsdc(units) {
+  return Number(units) / 10 ** USDC_DECIMALS;
+}
+function usdcLabel(units) {
+  return `${unitsToUsdc(units).toFixed(2)} USDC`;
+}
+// The price the shim asks for and checks against: the ledger's current floor
+// when state.json is readable, else the genesis floor (see the constants).
+function priceFromState(state) {
+  const floor = state && typeof state.floor_usdc === "number" ? state.floor_usdc : null;
+  if (floor !== null && Number.isFinite(floor) && floor > 0 && floor <= MAX_SANE_FLOOR_USDC) {
+    const units = usdcToUnits(floor);
+    return { units, usdc: unitsToUsdc(units), tier: state.pricing_tier || null, source: "state.json" };
+  }
+  return {
+    units: GENESIS_FLOOR_BASE_UNITS,
+    usdc: unitsToUsdc(GENESIS_FLOOR_BASE_UNITS),
+    tier: GENESIS_TIER,
+    source: "fallback",
+  };
+}
+const FALLBACK_PRICE = priceFromState(null);
 
 // Multi-endpoint fallback (same list as test/verify_transfer.js). Public RPCs
 // occasionally 429 or lag on indexing; a paying buyer must never see a false
@@ -265,10 +304,10 @@ function addrFromTopic(topic) {
 //   sender (topic 1) == payer  (== the sender of the settlement; the log IS
 //                               the sender's signature of record)
 //   recipient (topic 2) == pay_to (0xbbF4D6B9…D9f23)
-//   amount (data) >= 1.00 USDC (1000000 base units)
+//   amount (data) >= the current floor (price.units; 1.00 USDC in genesis)
 // and, when the proof declares a payer, that payer matches the log sender.
 // ---------------------------------------------------------------------------
-async function verifySettledUsdcTransfer(txHash, declaredPayer, env) {
+async function verifySettledUsdcTransfer(txHash, declaredPayer, env, price = FALLBACK_PRICE) {
   if (!TX_HASH_RE.test(txHash)) {
     return { ok: false, reason: "malformed transaction hash", retryable: false };
   }
@@ -303,6 +342,8 @@ async function verifySettledUsdcTransfer(txHash, declaredPayer, env) {
   }
   const payTo = PAY_TO.toLowerCase();
   const usdc = USDC_CONTRACT.toLowerCase();
+  // The largest USDC transfer to pay_to in this transaction (from the declared
+  // payer, when one is declared) is the settlement; it must cover the floor.
   let transfer = null;
   for (const log of receipt.logs || []) {
     if (!log.address || log.address.toLowerCase() !== usdc) continue;
@@ -317,7 +358,6 @@ async function verifySettledUsdcTransfer(txHash, declaredPayer, env) {
     } catch {
       continue;
     }
-    if (value < PRICE_BASE_UNITS) continue;
     if (declaredPayer && declaredPayer.toLowerCase() !== from) {
       return {
         ok: false,
@@ -325,15 +365,25 @@ async function verifySettledUsdcTransfer(txHash, declaredPayer, env) {
         retryable: false,
       };
     }
-    transfer = { payer: from, value: value.toString() };
-    break;
+    if (!transfer || value > transfer.units) transfer = { payer: from, units: value };
   }
   if (!transfer) {
     return {
       ok: false,
-      reason:
-        "no USDC Transfer log from the payer to pay_to with amount >= 1.00 USDC in this transaction",
+      reason: "no USDC Transfer log from the payer to pay_to in this transaction",
       retryable: false,
+    };
+  }
+  if (transfer.units < price.units) {
+    return {
+      ok: false,
+      reason:
+        `paid ${usdcLabel(transfer.units)}; the current floor is ${usdcLabel(price.units)}` +
+        (price.tier ? ` (${price.tier} tier)` : "") +
+        ". No refunds: settle the full price in one transaction and claim with that one; " +
+        "the ledger verifier enforces the same ladder",
+      retryable: false,
+      amount_usdc: unitsToUsdc(transfer.units),
     };
   }
   const blockNumber = parseInt(receipt.blockNumber, 16);
@@ -358,7 +408,8 @@ async function verifySettledUsdcTransfer(txHash, declaredPayer, env) {
   return {
     ok: true,
     payer: transfer.payer,
-    value: transfer.value,
+    value: transfer.units.toString(),
+    amount_usdc: unitsToUsdc(transfer.units),
     block_number: blockNumber,
     confirmations,
     agreeing: found.agreeing.length,
@@ -370,7 +421,13 @@ async function verifySettledUsdcTransfer(txHash, declaredPayer, env) {
 // A receipt names the next slot together with the state root it was read
 // against, so a consumer can tell when that advice has gone stale.
 async function fetchState(env) {
-  const empty = { next_slot: null, state_root: null, last_updated: null };
+  const empty = {
+    next_slot: null,
+    state_root: null,
+    last_updated: null,
+    floor_usdc: null,
+    pricing_tier: null,
+  };
   try {
     const res = await fetch(cfg(env, "STATE_URL", DEFAULT_STATE_URL), {
       signal: timeoutSignal(5000),
@@ -378,10 +435,13 @@ async function fetchState(env) {
     if (!res.ok) return empty;
     const state = await res.json();
     const str = (v) => (typeof v === "string" ? v : null);
+    const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
     return {
       next_slot: str(state.next_available_slot),
       state_root: str(state.merkle_root),
       last_updated: str(state.last_updated),
+      floor_usdc: num(state.current_floor_usdc),
+      pricing_tier: str(state.pricing_tier),
     };
   } catch {
     return empty;
@@ -433,6 +493,9 @@ function receiptSchema() {
       block_number: { type: ["integer", "null"] },
       confirmations: { type: ["integer", "null"] },
       rpc_agreement: { type: ["string", "null"] },
+      amount_usdc: { type: ["number", "null"] },
+      floor_usdc: { type: ["number", "null"] },
+      pricing_tier: { type: ["string", "null"] },
       next_slot: { type: ["string", "null"] },
       state_root: { type: ["string", "null"] },
       state_last_updated: { type: ["string", "null"] },
@@ -446,7 +509,7 @@ function receiptSchema() {
   };
 }
 
-function buildReceipt(txHash, verdict, state, now) {
+function buildReceipt(txHash, verdict, state, now, price = priceFromState(state)) {
   const issued = new Date(now);
   const expires = new Date(now + RECEIPT_TTL_SECONDS * 1000);
   return {
@@ -457,6 +520,9 @@ function buildReceipt(txHash, verdict, state, now) {
     block_number: verdict.block_number,
     confirmations: verdict.confirmations,
     rpc_agreement: `${verdict.agreeing}/${verdict.asked}`,
+    amount_usdc: verdict.amount_usdc ?? null,
+    floor_usdc: price.usdc,
+    pricing_tier: price.tier,
     next_slot: state.next_slot,
     state_root: state.state_root,
     state_last_updated: state.last_updated,
@@ -467,7 +533,7 @@ function buildReceipt(txHash, verdict, state, now) {
   };
 }
 
-function bazaarExtension(resourceUrl) {
+function bazaarExtension(resourceUrl, price) {
   // `extensions.bazaar` discovery metadata, shaped like the x402 Foundation
   // Bazaar extension (python/x402/extensions/bazaar): {info, schema}, where
   // `info` carries the values and `schema` JSON-Schema-validates `info`.
@@ -480,6 +546,13 @@ function bazaarExtension(resourceUrl) {
         description: DESCRIPTION,
         tags: TAGS,
         docs: DOCS_URL,
+        price: {
+          usdc: price.usdc,
+          base_units: price.units.toString(),
+          tier: price.tier,
+          source: price.source === "state.json" ? DEFAULT_STATE_URL : "genesis floor (state.json unavailable)",
+          rule: PRICE_RULE,
+        },
         input: {
           type: "http",
           method: "GET",
@@ -499,6 +572,9 @@ function bazaarExtension(resourceUrl) {
             block_number: 52466861,
             confirmations: 1200,
             rpc_agreement: "2/3",
+            amount_usdc: 1,
+            floor_usdc: 1,
+            pricing_tier: "genesis",
             next_slot: "w1-b0011",
             state_root: "0c8ca2ae4b2774e3fa6f2c7e4b65573723e7a57211b8be8c4719244808caaa76",
             state_last_updated: "2026-10-08T21:52:00Z",
@@ -543,7 +619,7 @@ function bazaarExtension(resourceUrl) {
   };
 }
 
-function paymentRequired(resourceUrl, error) {
+function paymentRequired(resourceUrl, error, price = FALLBACK_PRICE) {
   return {
     x402Version: 2,
     error: error || "Payment Required",
@@ -556,9 +632,9 @@ function paymentRequired(resourceUrl, error) {
       {
         scheme: "exact",
         network: NETWORK,
-        amount: PRICE_BASE_UNITS.toString(),
+        amount: price.units.toString(),
         // v1 clients read `maxAmountRequired`; v2 reads `amount`.
-        maxAmountRequired: PRICE_BASE_UNITS.toString(),
+        maxAmountRequired: price.units.toString(),
         asset: USDC_CONTRACT,
         payTo: PAY_TO,
         maxTimeoutSeconds: 600,
@@ -567,12 +643,12 @@ function paymentRequired(resourceUrl, error) {
         outputSchema: receiptSchema(),
       },
     ],
-    extensions: bazaarExtension(resourceUrl),
+    extensions: bazaarExtension(resourceUrl, price),
   };
 }
 
-function paymentRequiredResponse(resourceUrl, error, status) {
-  const body = paymentRequired(resourceUrl, error);
+function paymentRequiredResponse(resourceUrl, error, status, price) {
+  const body = paymentRequired(resourceUrl, error, price);
   const header = b64Encode(JSON.stringify(body));
   return json(body, status || 402, {
     // x402 v2 canonical location (base64 PaymentRequired)
@@ -642,6 +718,10 @@ async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
       { "retry-after": String(RATE_LIMIT.periodSeconds) }
     );
   }
+  // The live floor first: it is what the 402 asks for and what the proof is
+  // checked against, read once per request so both agree.
+  const state = await fetchState(env);
+  const price = priceFromState(state);
   const headerValue =
     request.headers.get("X-PAYMENT") ||
     request.headers.get("PAYMENT-SIGNATURE") ||
@@ -650,23 +730,28 @@ async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
   if (!headerValue) {
     return paymentRequiredResponse(
       resourceUrl,
-      "Payment Required: send the settled-transaction proof in the X-PAYMENT (or PAYMENT-SIGNATURE) header"
+      "Payment Required: send the settled-transaction proof in the X-PAYMENT (or PAYMENT-SIGNATURE) header",
+      402,
+      price
     );
   }
   const proof = extractProof(headerValue);
   if (proof.error) {
-    return paymentRequiredResponse(resourceUrl, `invalid payment proof: ${proof.error}`, 400);
+    return paymentRequiredResponse(resourceUrl, `invalid payment proof: ${proof.error}`, 400, price);
   }
-  const verdict = await verifySettledUsdcTransfer(proof.txHash, proof.payer, env);
+  const verdict = await verifySettledUsdcTransfer(proof.txHash, proof.payer, env, price);
   if (!verdict.ok) {
     const body = {
       verified: false,
       advisory: true,
       tx_hash: proof.txHash,
+      floor_usdc: price.usdc,
+      pricing_tier: price.tier,
       next_slot: null,
       retryable: Boolean(verdict.retryable),
       next_step: `payment not verified: ${verdict.reason}`,
     };
+    if (verdict.amount_usdc !== undefined) body.amount_usdc = verdict.amount_usdc;
     if (verdict.block_number !== undefined) body.block_number = verdict.block_number;
     if (verdict.confirmations !== undefined) body.confirmations = verdict.confirmations;
     return json(
@@ -681,8 +766,7 @@ async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
       })
     );
   }
-  const state = await fetchState(env);
-  const receipt = buildReceipt(proof.txHash, verdict, state, now);
+  const receipt = buildReceipt(proof.txHash, verdict, state, now, price);
   return json(
     receipt,
     200,
@@ -691,6 +775,8 @@ async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
       transaction: proof.txHash,
       network: NETWORK,
       payer: verdict.payer,
+      amount_usdc: verdict.amount_usdc,
+      floor_usdc: price.usdc,
       block_number: verdict.block_number,
       confirmations: verdict.confirmations,
       next_slot: state.next_slot,
@@ -708,6 +794,8 @@ export const __test = {
   receiptFingerprint,
   verifySettledUsdcTransfer,
   buildReceipt,
+  fetchState,
+  priceFromState,
   rateLimited,
   handlePaidClaim,
   resetRateLimits: () => buckets.clear(),
@@ -754,7 +842,9 @@ export default {
         return handlePaidClaim(request, env, resourceUrl);
       }
       if (method === "GET" || method === "HEAD") {
-        return paymentRequiredResponse(resourceUrl);
+        // The requirements name the ledger's current floor, read live.
+        const price = priceFromState(await fetchState(env));
+        return paymentRequiredResponse(resourceUrl, undefined, 402, price);
       }
       return json({ error: "method not allowed" }, 405, { allow: "GET, HEAD, POST" });
     }
