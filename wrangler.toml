@@ -28,7 +28,22 @@ SITE_URL = "https://thefirstwall.ai"
 # cannot be pinned yet. Point at the live workers.dev URL until the zone moves,
 # then flip back to https://x402.thefirstwall.ai/claim and pin the domain below.
 RESOURCE_URL = "https://thefirstwall-x402.thefirstwall.workers.dev/claim"
+# Settlement finality before a receipt is issued (blocks below the chain head);
+# keep equal to the ledger's state.json `min_confirmations`.
+MIN_CONFIRMATIONS = "300"
+# Independent RPC endpoints that must return the same receipt.
+RPC_QUORUM = "2"
 
 # Operator TODO (after `wrangler login`): pin the custom domain on YOUR account.
 # Uncomment and adjust once the zone is on the deploying account:
 # routes = [{ pattern = "x402.thefirstwall.ai/*", custom_domain = true }]
+
+# Optional: Cloudflare rate-limiting binding for POST /claim (per colo). Without
+# it the worker falls back to a per-isolate token bucket (10 per minute per
+# client IP). Check the current syntax in the Cloudflare docs before enabling:
+# https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+# [[unsafe.bindings]]
+# name = "CLAIM_RATE_LIMITER"
+# type = "ratelimit"
+# namespace_id = "1001"
+# simple = { limit = 10, period = 60 }
