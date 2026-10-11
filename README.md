@@ -81,13 +81,14 @@ plus `PAYMENT-RESPONSE` / `X-PAYMENT-RESPONSE` headers (base64
 
 `verifySettledUsdcTransfer()` in `index.js` — read-only, deterministic:
 
-1. `eth_getTransactionReceipt(txHash)` on Base mainnet (public RPCs, queried in
-   parallel across `mainnet.base.org`, `publicnode`, `1rpc`, `llamarpc`,
-   `drpc`, `tenderly` — liveness: at least one answers; a non-null receipt
-   from any is treated as chain truth). Blast-radius note: a forged receipt
-   from one compromised endpoint could pass *this* layer, but the worker
-   writes nothing to the ledger — the PR-time deterministic verifier + human
-   merge gate independently confirm settlement.
+1. `eth_getTransactionReceipt(txHash)` on Base mainnet across public endpoints
+   (`mainnet.base.org`, `publicnode`, `1rpc`, `llamarpc`, `drpc`, `tenderly`),
+   with a **quorum**: a receipt is believed only when `RPC_QUORUM` (default 2)
+   independent endpoints return the *same* receipt (same block, same USDC
+   `Transfer` logs). The nearest `quorum + 1` endpoints are asked first; the
+   rest only when those do not settle it. One lying or lagging node can
+   neither fake nor hide a payment; disagreement or indexing lag yields a
+   retryable 402, never a verdict.
 2. Require `receipt.status == 0x1`.
 3. Scan `receipt.logs` for the ERC-20 `Transfer` event
    (`keccak256("Transfer(address,address,uint256)")`) on the **USDC contract**
@@ -97,9 +98,33 @@ plus `PAYMENT-RESPONSE` / `X-PAYMENT-RESPONSE` headers (base64
    - `amount` (data) **≥ 1.00 USDC** (1,000,000 base units, 6 decimals).
 4. If the proof declares a payer (`payload.authorization.from` / `payer`), it must
    equal the Transfer sender.
-5. `next_slot` is read *live* from `https://thefirstwall.ai/state.json` at request
-   time — never cached, never stored. If that fetch fails the receipt simply says
-   `"next_slot": null`.
+5. **Finality:** the chain head is read from the agreeing endpoints (the
+   quorum-th highest answer) and the transfer must be at least
+   `MIN_CONFIRMATIONS` (default 300, the ledger's rule) blocks deep. A shallower
+   payment gets a retryable 402 naming the block to retry after, so an agent never
+   opens a PR the ledger verifier would reject as too shallow.
+6. `next_slot` is read *live* from `https://thefirstwall.ai/state.json` at request
+   time — never cached, never stored — together with the `merkle_root` it was read
+   against.
+
+### The receipt is advisory, and bound
+
+A successful receipt carries `tx_hash`, `payer`, `block_number`, `confirmations`,
+`rpc_agreement`, `next_slot`, `state_root`, `state_last_updated`, `issued_at` and
+`expires_at` (10 minutes), plus `advisory: true`. It restates public chain facts
+and the live next slot; nothing downstream trusts it — the ledger verifier
+re-checks the transfer itself on every PR. That is what makes a replayed or
+forged receipt worthless: it grants nothing. A failed verification says
+`retryable: true` (not found yet, no quorum yet, too shallow, RPC outage) or
+`retryable: false` (wrong recipient, amount, payer, reverted).
+
+### Rate limit
+
+`POST /claim` (and a `GET` carrying a proof) is limited to 10 verifications per
+client IP per minute: via the Cloudflare rate-limiting binding
+`CLAIM_RATE_LIMITER` when configured (see `wrangler.toml`), otherwise a
+per-isolate token bucket. Each verification fans out to at most the configured
+endpoints, so the worker cannot be driven as an RPC amplifier.
 
 No state means no replay table — and none is needed: this worker grants nothing but
 a receipt. **A transaction hash can never inscribe two slots**; that replay check
@@ -178,6 +203,9 @@ facilitator**. Per
 ## Testing
 
 ```bash
+# unit tests with a stubbed network: proof parsing, quorum, finality, receipts, rate limit
+npm test
+
 # 402 handshake + receipt flow (local dev or deployed)
 npm run dev            # in one terminal
 BASE_URL=http://127.0.0.1:8787 ./test/dryrun.sh

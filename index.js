@@ -9,8 +9,10 @@
  *                     `extensions.bazaar` discovery metadata.
  *   POST /claim    -> verify the X-PAYMENT (or PAYMENT-SIGNATURE) proof
  *                     STATELESSLY on Base RPC (read-only
- *                     eth_getTransactionReceipt + USDC Transfer log match),
- *                     then return a receipt with the live next slot.
+ *                     eth_getTransactionReceipt + USDC Transfer log match,
+ *                     agreed by a quorum of independent endpoints, at least
+ *                     MIN_CONFIRMATIONS deep), then return an ADVISORY
+ *                     receipt bound to (tx, next slot, state root, expiry).
  *   GET  /healthz  -> {"ok":true}
  *   GET  /         -> 302 to https://thefirstwall.ai
  *
@@ -55,6 +57,22 @@ const TAGS = ["permanence", "census", "memorial", "ai-agents", "inscription"];
 
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
+// Settlement finality, aligned with the ledger (spec.md 2.9 / state.json
+// min_confirmations): a receipt is issued only once the transfer is this many
+// blocks below the chain head, so an agent never opens a PR the verifier will
+// reject as too shallow.
+const DEFAULT_MIN_CONFIRMATIONS = 300;
+// Independent RPC endpoints that must return the SAME receipt (same block,
+// same USDC Transfer logs) before it is believed. One lying or lagging node
+// can neither fake nor hide a payment.
+const DEFAULT_RPC_QUORUM = 2;
+// A receipt's `next_slot` is advice about a moving target; it carries an
+// expiry and the state root it was read against.
+const RECEIPT_TTL_SECONDS = 600;
+// Paid-claim verifications per client per window (each one fans out to the
+// RPC endpoints, so this is what keeps the worker from being an amplifier).
+const RATE_LIMIT = { limit: 10, periodSeconds: 60 };
+
 // ---------------------------------------------------------------------------
 // Small helpers (no dependencies; Workers-safe)
 // ---------------------------------------------------------------------------
@@ -92,6 +110,10 @@ function json(body, status, headers) {
 }
 function cfg(env, key, fallback) {
   return (env && env[key]) || fallback;
+}
+function cfgInt(env, key, fallback) {
+  const n = parseInt(cfg(env, key, fallback), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 // Multi-endpoint fallback (same list as test/verify_transfer.js). Public RPCs
@@ -138,37 +160,96 @@ async function rpcTry(url, method, params, attempts, timeoutMs) {
   throw lastErr;
 }
 
-// Receipt lookup across endpoints. Primary first (polite, cheap); if it flaked,
-// the fallbacks run in parallel and the first non-null receipt wins (chain
-// truth). A throttled or lagging node can therefore never produce a false
-// negative for a just-settled payment. Worst-case wall time is bounded.
-async function getReceiptAcrossRpcs(env, txHash) {
-  // All endpoints queried in parallel: fastest non-null receipt wins (chain
-  // truth), so a throttled or lagging node cannot produce a false negative for
-  // a just-settled payment. "Not found" is only believed when at least one
-  // endpoint answered at all. Worst-case wall time ~16s (2 tries x 8s + back-off).
-  const urls = rpcUrls(env);
+// Receipt lookup across endpoints with a QUORUM. Two endpoints "agree" only
+// when they return the same block and the same USDC Transfer logs — not merely
+// both non-null — so one compromised or lagging node can neither fake nor hide
+// a payment. The nearest quorum+1 endpoints are asked first (bounded fan-out);
+// the rest are consulted only when those do not settle the question.
+function receiptFingerprint(receipt) {
+  const usdc = USDC_CONTRACT.toLowerCase();
+  const logs = (receipt.logs || [])
+    .filter((l) => l.address && l.address.toLowerCase() === usdc)
+    .map((l) => [
+      (l.topics || []).map((t) => String(t).toLowerCase()),
+      String(l.data || "0x").toLowerCase(),
+    ]);
+  return JSON.stringify([
+    receipt.status,
+    String(receipt.blockHash || "").toLowerCase(),
+    receipt.blockNumber,
+    logs,
+  ]);
+}
+
+async function askEndpoints(urls, method, params) {
   const settled = await Promise.allSettled(
-    urls.map((url) =>
-      rpcTry(url, "eth_getTransactionReceipt", [txHash], 2, 8000)
-    )
+    urls.map((url) => rpcTry(url, method, params, 2, 8000))
   );
-  const answers = settled.map((r) =>
+  return settled.map((r, i) =>
     r.status === "fulfilled"
-      ? { ok: true, value: r.value }
-      : { ok: false, err: r.reason }
+      ? { url: urls[i], ok: true, value: r.value }
+      : { url: urls[i], ok: false, err: r.reason }
   );
-  for (const a of answers) if (a.ok && a.value) return a.value;
-  if (answers.some((a) => a.ok)) return null; // answered: not found (yet)
-  // Every endpoint flaked — honest, retryable failure with the full picture.
-  throw new Error(
-    "all " +
-      urls.length +
-      " RPC endpoints failed: " +
-      answers
-        .map((a, i) => `${urls[i]} -> ${a.err.message}`)
-        .join(" | ")
-  );
+}
+
+// Decide what a set of answers proves. Returns one of:
+//   {kind:"found", receipt, agreeing:[urls], asked}
+//   {kind:"not_found", answered}      >= quorum endpoints answered "no such tx"
+//   {kind:"undecided", nonNull, nulls, answered}   lag or disagreement
+//   {kind:"unavailable", errors}      nobody answered at all
+function judge(answers, quorum) {
+  const ok = answers.filter((a) => a.ok);
+  if (!ok.length) {
+    return {
+      kind: "unavailable",
+      errors: answers.map((a) => `${a.url} -> ${a.err ? a.err.message : "?"}`),
+    };
+  }
+  const groups = new Map();
+  for (const a of ok) {
+    if (!a.value) continue;
+    const fp = receiptFingerprint(a.value);
+    const g = groups.get(fp) || { receipt: a.value, urls: [] };
+    g.urls.push(a.url);
+    groups.set(fp, g);
+  }
+  for (const g of groups.values()) {
+    if (g.urls.length >= quorum) {
+      return { kind: "found", receipt: g.receipt, agreeing: g.urls, asked: answers.length };
+    }
+  }
+  const nulls = ok.filter((a) => !a.value).length;
+  const nonNull = ok.length - nulls;
+  if (!nonNull && nulls >= quorum) return { kind: "not_found", answered: nulls };
+  return { kind: "undecided", nonNull, nulls, answered: ok.length };
+}
+
+async function getReceiptAcrossRpcs(env, txHash) {
+  const urls = rpcUrls(env);
+  const quorum = Math.min(cfgInt(env, "RPC_QUORUM", DEFAULT_RPC_QUORUM), urls.length);
+  const first = urls.slice(0, quorum + 1);
+  const rest = urls.slice(quorum + 1);
+  const answers = await askEndpoints(first, "eth_getTransactionReceipt", [txHash]);
+  let verdict = judge(answers, quorum);
+  if (verdict.kind !== "found" && verdict.kind !== "not_found" && rest.length) {
+    answers.push(...(await askEndpoints(rest, "eth_getTransactionReceipt", [txHash])));
+    verdict = judge(answers, quorum);
+  }
+  verdict.quorum = quorum;
+  return verdict;
+}
+
+// Chain head as seen by the endpoints that agreed on the receipt: the
+// quorum-th highest answer, so a single node cannot inflate the depth.
+async function headBlockFromAgreeing(agreeingUrls, quorum) {
+  const answers = await askEndpoints(agreeingUrls, "eth_blockNumber", []);
+  const heads = answers
+    .filter((a) => a.ok && typeof a.value === "string")
+    .map((a) => parseInt(a.value, 16))
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => b - a);
+  if (!heads.length) return null;
+  return heads[Math.min(quorum, heads.length) - 1];
 }
 
 function addrFromTopic(topic) {
@@ -189,24 +270,40 @@ function addrFromTopic(topic) {
 // ---------------------------------------------------------------------------
 async function verifySettledUsdcTransfer(txHash, declaredPayer, env) {
   if (!TX_HASH_RE.test(txHash)) {
-    return { ok: false, reason: "malformed transaction hash" };
+    return { ok: false, reason: "malformed transaction hash", retryable: false };
   }
-  let receipt;
+  let found;
   try {
-    // Cross-endpoint lookup: first non-null receipt wins, so one lagging node
-    // cannot answer "not found" for a just-settled payment.
-    receipt = await getReceiptAcrossRpcs(env, txHash);
+    found = await getReceiptAcrossRpcs(env, txHash);
   } catch (err) {
-    return { ok: false, reason: `Base RPC unavailable: ${err.message}` };
+    return { ok: false, reason: `Base RPC unavailable: ${err.message}`, retryable: true };
   }
-  if (!receipt) {
-    return { ok: false, reason: "transaction not found on Base (yet)" };
+  if (found.kind === "unavailable") {
+    return {
+      ok: false,
+      reason: `Base RPC unavailable: ${found.errors.join(" | ")}`,
+      retryable: true,
+    };
   }
+  if (found.kind === "not_found") {
+    return { ok: false, reason: "transaction not found on Base (yet)", retryable: true };
+  }
+  if (found.kind !== "found") {
+    return {
+      ok: false,
+      reason:
+        `no ${found.quorum}-endpoint agreement on this transaction yet ` +
+        `(${found.nonNull} returned a receipt, ${found.nulls} none, of ${found.answered}); retry shortly`,
+      retryable: true,
+    };
+  }
+  const receipt = found.receipt;
   if (receipt.status !== "0x1") {
-    return { ok: false, reason: "transaction reverted" };
+    return { ok: false, reason: "transaction reverted", retryable: false };
   }
   const payTo = PAY_TO.toLowerCase();
   const usdc = USDC_CONTRACT.toLowerCase();
+  let transfer = null;
   for (const log of receipt.logs || []) {
     if (!log.address || log.address.toLowerCase() !== usdc) continue;
     if (!log.topics || log.topics.length < 3) continue;
@@ -225,53 +322,148 @@ async function verifySettledUsdcTransfer(txHash, declaredPayer, env) {
       return {
         ok: false,
         reason: "payer mismatch: proof payer != USDC Transfer sender",
+        retryable: false,
       };
     }
+    transfer = { payer: from, value: value.toString() };
+    break;
+  }
+  if (!transfer) {
     return {
-      ok: true,
-      payer: from,
-      value: value.toString(),
-      blockNumber: receipt.blockNumber,
+      ok: false,
+      reason:
+        "no USDC Transfer log from the payer to pay_to with amount >= 1.00 USDC in this transaction",
+      retryable: false,
+    };
+  }
+  const blockNumber = parseInt(receipt.blockNumber, 16);
+  const minConf = cfgInt(env, "MIN_CONFIRMATIONS", DEFAULT_MIN_CONFIRMATIONS);
+  const head = await headBlockFromAgreeing(found.agreeing, found.quorum);
+  if (head === null) {
+    return { ok: false, reason: "could not read the Base chain head", retryable: true };
+  }
+  const confirmations = Math.max(0, head - blockNumber);
+  if (confirmations < minConf) {
+    return {
+      ok: false,
+      reason:
+        `settled in block ${blockNumber} but only ${confirmations} of ${minConf} confirmations; ` +
+        `retry after block ${blockNumber + minConf}`,
+      retryable: true,
+      block_number: blockNumber,
+      confirmations,
+      claimable_after_block: blockNumber + minConf,
     };
   }
   return {
-    ok: false,
-    reason:
-      "no USDC Transfer log from the payer to pay_to with amount >= 1.00 USDC in this transaction",
+    ok: true,
+    payer: transfer.payer,
+    value: transfer.value,
+    block_number: blockNumber,
+    confirmations,
+    agreeing: found.agreeing.length,
+    asked: found.asked,
   };
 }
 
-// Live next slot — read at request time from the static site, never stored.
-async function fetchNextSlot(env) {
+// Live ledger state — read at request time from the static site, never stored.
+// A receipt names the next slot together with the state root it was read
+// against, so a consumer can tell when that advice has gone stale.
+async function fetchState(env) {
+  const empty = { next_slot: null, state_root: null, last_updated: null };
   try {
     const res = await fetch(cfg(env, "STATE_URL", DEFAULT_STATE_URL), {
       signal: timeoutSignal(5000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) return empty;
     const state = await res.json();
-    return typeof state.next_available_slot === "string"
-      ? state.next_available_slot
-      : null;
+    const str = (v) => (typeof v === "string" ? v : null);
+    return {
+      next_slot: str(state.next_available_slot),
+      state_root: str(state.merkle_root),
+      last_updated: str(state.last_updated),
+    };
   } catch {
-    return null;
+    return empty;
   }
+}
+
+// Per-client rate limit on paid-claim verification. Uses the Cloudflare
+// rate-limiting binding when one is configured (CLAIM_RATE_LIMITER), else a
+// per-isolate token bucket (best effort, but it still bounds the fan-out a
+// single client can cause from one colo). No state leaves the isolate.
+const buckets = new Map();
+async function rateLimited(request, env) {
+  const key = request.headers.get("cf-connecting-ip") || "unknown";
+  const binding = env && env.CLAIM_RATE_LIMITER;
+  if (binding && typeof binding.limit === "function") {
+    try {
+      const { success } = await binding.limit({ key });
+      return !success;
+    } catch {
+      /* fall back to the local bucket */
+    }
+  }
+  const now = Date.now();
+  const b = buckets.get(key);
+  if (!b || b.resetAt <= now) {
+    if (buckets.size > 10000) buckets.clear();
+    buckets.set(key, { count: 1, resetAt: now + RATE_LIMIT.periodSeconds * 1000 });
+    return false;
+  }
+  b.count += 1;
+  return b.count > RATE_LIMIT.limit;
 }
 
 // ---------------------------------------------------------------------------
 // x402 objects
 // ---------------------------------------------------------------------------
+// The receipt is ADVISORY: it restates public chain facts and the live next
+// slot. Nothing downstream trusts it — the ledger verifier re-checks the
+// transfer itself — which is exactly what makes a replayed receipt worthless.
 function receiptSchema() {
   return {
     $schema: "https://json-schema.org/draft/2020-12/schema",
     type: "object",
     properties: {
       verified: { type: "boolean" },
+      advisory: { type: "boolean", const: true },
       tx_hash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
+      payer: { type: ["string", "null"], pattern: "^0x[0-9a-f]{40}$" },
+      block_number: { type: ["integer", "null"] },
+      confirmations: { type: ["integer", "null"] },
+      rpc_agreement: { type: ["string", "null"] },
       next_slot: { type: ["string", "null"] },
+      state_root: { type: ["string", "null"] },
+      state_last_updated: { type: ["string", "null"] },
+      issued_at: { type: ["string", "null"] },
+      expires_at: { type: ["string", "null"] },
+      retryable: { type: "boolean" },
       next_step: { type: "string" },
     },
-    required: ["verified", "tx_hash", "next_slot", "next_step"],
+    required: ["verified", "advisory", "tx_hash", "next_slot", "next_step"],
     additionalProperties: false,
+  };
+}
+
+function buildReceipt(txHash, verdict, state, now) {
+  const issued = new Date(now);
+  const expires = new Date(now + RECEIPT_TTL_SECONDS * 1000);
+  return {
+    verified: true,
+    advisory: true,
+    tx_hash: txHash,
+    payer: verdict.payer,
+    block_number: verdict.block_number,
+    confirmations: verdict.confirmations,
+    rpc_agreement: `${verdict.agreeing}/${verdict.asked}`,
+    next_slot: state.next_slot,
+    state_root: state.state_root,
+    state_last_updated: state.last_updated,
+    issued_at: issued.toISOString(),
+    expires_at: expires.toISOString(),
+    retryable: false,
+    next_step: NEXT_STEP,
   };
 }
 
@@ -300,9 +492,19 @@ function bazaarExtension(resourceUrl) {
           type: "json",
           example: {
             verified: true,
+            advisory: true,
             tx_hash:
               "0x7652e3aa8c0e19f34c1c25b10d10aa10ff8d19f34c1c25b10d10aa10ff8d69f6",
+            payer: "0x1111111111111111111111111111111111111111",
+            block_number: 52466861,
+            confirmations: 1200,
+            rpc_agreement: "2/3",
             next_slot: "w1-b0011",
+            state_root: "0c8ca2ae4b2774e3fa6f2c7e4b65573723e7a57211b8be8c4719244808caaa76",
+            state_last_updated: "2026-10-08T21:52:00Z",
+            issued_at: "2026-10-11T13:00:00.000Z",
+            expires_at: "2026-10-11T13:10:00.000Z",
+            retryable: false,
             next_step: NEXT_STEP,
           },
           schema: receiptSchema(),
@@ -425,7 +627,21 @@ function extractProof(headerValue) {
 // ---------------------------------------------------------------------------
 // Paid claim handler (POST /claim, or any method carrying a payment proof)
 // ---------------------------------------------------------------------------
-async function handlePaidClaim(request, env, resourceUrl) {
+async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
+  if (await rateLimited(request, env)) {
+    return json(
+      {
+        verified: false,
+        advisory: true,
+        tx_hash: "",
+        next_slot: null,
+        retryable: true,
+        next_step: `rate limited: at most ${RATE_LIMIT.limit} verifications per ${RATE_LIMIT.periodSeconds}s per client`,
+      },
+      429,
+      { "retry-after": String(RATE_LIMIT.periodSeconds) }
+    );
+  }
   const headerValue =
     request.headers.get("X-PAYMENT") ||
     request.headers.get("PAYMENT-SIGNATURE") ||
@@ -443,40 +659,59 @@ async function handlePaidClaim(request, env, resourceUrl) {
   }
   const verdict = await verifySettledUsdcTransfer(proof.txHash, proof.payer, env);
   if (!verdict.ok) {
+    const body = {
+      verified: false,
+      advisory: true,
+      tx_hash: proof.txHash,
+      next_slot: null,
+      retryable: Boolean(verdict.retryable),
+      next_step: `payment not verified: ${verdict.reason}`,
+    };
+    if (verdict.block_number !== undefined) body.block_number = verdict.block_number;
+    if (verdict.confirmations !== undefined) body.confirmations = verdict.confirmations;
     return json(
-      {
-        verified: false,
-        tx_hash: proof.txHash,
-        next_slot: null,
-        next_step: `payment not verified: ${verdict.reason}`,
-      },
+      body,
       402,
       settlementHeader({
         success: false,
-        errorReason: "invalid_payment",
+        errorReason: verdict.retryable ? "settlement_pending" : "invalid_payment",
         transaction: proof.txHash,
         network: NETWORK,
         payer: proof.payer || "",
       })
     );
   }
-  const nextSlot = await fetchNextSlot(env);
+  const state = await fetchState(env);
+  const receipt = buildReceipt(proof.txHash, verdict, state, now);
   return json(
-    {
-      verified: true,
-      tx_hash: proof.txHash,
-      next_slot: nextSlot,
-      next_step: NEXT_STEP,
-    },
+    receipt,
     200,
     settlementHeader({
       success: true,
       transaction: proof.txHash,
       network: NETWORK,
       payer: verdict.payer,
+      block_number: verdict.block_number,
+      confirmations: verdict.confirmations,
+      next_slot: state.next_slot,
+      state_root: state.state_root,
+      expires_at: receipt.expires_at,
     })
   );
 }
+
+// Exposed for the unit tests only (test/unit.test.js); the Worker's public
+// surface is the default export below.
+export const __test = {
+  extractProof,
+  judge,
+  receiptFingerprint,
+  verifySettledUsdcTransfer,
+  buildReceipt,
+  rateLimited,
+  handlePaidClaim,
+  resetRateLimits: () => buckets.clear(),
+};
 
 // ---------------------------------------------------------------------------
 // Router
