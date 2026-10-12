@@ -1,38 +1,47 @@
 /**
- * The First Wall — x402 claim verifier (Wall 01)
+ * The First Wall — x402 claim endpoint (Wall 01)
  * ==============================================
- * A minimal, STATELESS, CUSTODY-FREE Cloudflare Worker.
+ * A minimal, STATELESS, CUSTODY-FREE Cloudflare Worker: an x402 v2 resource
+ * server for the claim payment.
  *
  * What it is:
- *   POST /claim    -> verify the X-PAYMENT (or PAYMENT-SIGNATURE) proof
- *                     STATELESSLY on Base RPC (read-only
+ *   GET | HEAD | POST /claim, no payment header
+ *                  -> 402 Payment Required: PaymentRequired (accepts[]: USDC on
+ *                     Base mainnet, the ledger's current floor read from
+ *                     state.json, a second option only within
+ *                     NEAR_BOUNDARY_BLOCKS of a tier boundary) and
+ *                     extensions.bazaar for discovery.
+ *   GET | POST /claim + PAYMENT-SIGNATURE (an x402 v2 exact / EIP-3009 payload)
+ *                  -> verify, then settle through the CDP facilitator; 200 with
+ *                     an ADVISORY receipt and PAYMENT-RESPONSE.
+ *   GET | POST /claim + X-PAYMENT or PAYMENT-SIGNATURE carrying a settled
+ *                     transaction hash (the agent paid by plain transfer)
+ *                  -> verified STATELESSLY on Base RPC (read-only
  *                     eth_getTransactionReceipt + USDC Transfer log match,
  *                     agreed by a quorum of independent endpoints, at least
- *                     MIN_CONFIRMATIONS deep, for at least the ledger's current
- *                     floor read from state.json for this very verification),
- *                     then return an ADVISORY receipt bound to (tx, next slot,
- *                     state root, expiry). Without a proof: a static 402 that
- *                     points at state.json (the price) and skill.md (the flow);
- *                     nothing is fetched for it.
- *   GET  /claim    -> 405. There is no unauthenticated 402 route: each such
- *                     answer would cost a state.json read, and the price it
- *                     would name is public in state.json (current_floor_usdc).
+ *                     MIN_CONFIRMATIONS deep, for at least the floor); 200 with
+ *                     an ADVISORY receipt bound to (tx, next slot, state root,
+ *                     expiry).
  *   GET  /healthz  -> {"ok":true}
  *   GET  /         -> 302 to https://thefirstwall.ai
  *
  * What it NEVER does:
- *   - no database, no queue, no cache, no cookies, no sessions
- *   - no secrets, no API keys, no environment-held credentials
- *   - no key custody: it cannot sign, cannot move funds, holds nothing
+ *   - no database, no queue, no cookies, no sessions; the only state is a
+ *     short in-memory (and, on a custom domain, edge-cache) copy of the public
+ *     state.json
+ *   - one secret, no more: the facilitator API key (CDP_API_KEY_ID and
+ *     CDP_API_KEY_SECRET, wrangler secrets). It authorises verify and settle
+ *     requests; it does not decide where funds land. The buyer signs a
+ *     transfer to pay_to and the facilitator broadcasts exactly that.
+ *   - no key custody: it cannot sign a transfer, cannot move funds, holds nothing
  *   - no ledger writes: Git (github.com/the-first-wall/ledger) is the ONLY
- *     ledger. The PR flow in https://thefirstwall.ai/skill.md is unchanged.
- *   - no price of its own: the floor is read from state.json for every
- *     verification; when state.json cannot be read the verification fails
- *     closed (503, retryable). It never assumes a price.
+ *     ledger. The PR flow in https://thefirstwall.ai/skill.md is unchanged;
+ *     the ledger verifier re-checks every payment itself.
+ *   - no price of its own: the floor is read from state.json; when it cannot
+ *     be read the answer is 503 (retryable). It never assumes a price.
  *
  * Wire format: x402 v2 HTTP transport (PAYMENT-REQUIRED / PAYMENT-SIGNATURE /
- * PAYMENT-RESPONSE headers) with v1 compatibility (X-PAYMENT /
- * X-PAYMENT-RESPONSE names, `maxAmountRequired` alongside `amount`).
+ * PAYMENT-RESPONSE headers). x402 v1 payloads are not accepted.
  * See README.md "x402 spec notes & uncertainties".
  */
 
@@ -45,6 +54,17 @@ const NETWORK = "eip155:8453"; // CAIP-2 for Base mainnet
 const USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const PAY_TO = "0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23"; // ADDRESSES.md row 1
 const USDC_DECIMALS = 6;
+// EIP-712 domain of USDC on Base mainnet: the token contract's name() and
+// version(). (The Base Sepolia test token calls itself "USDC"; a wrong name
+// makes every buyer signature invalid.)
+const USDC_EIP712_NAME = "USD Coin";
+const USDC_EIP712_VERSION = "2";
+const MAX_TIMEOUT_SECONDS = 600;
+// A second payment option (the next tier's price) is offered only this close
+// to a tier boundary: the exact scheme refuses overpayment, and the ledger
+// assigns blocks in settlement order, so a claim near the boundary may land in
+// the next tier.
+const NEAR_BOUNDARY_BLOCKS = 10;
 // The ledger's price ladder (spec.json#pricing_tiers): the floor is the tier
 // price of the next free block and is read from state.json for every
 // verification (`current_floor_usdc`, `pricing_tier`). There is no fallback:
@@ -53,8 +73,6 @@ const USDC_DECIMALS = 6;
 // is the authority: the payment must cover the tier price of the block it is
 // assigned, overpayment is accepted, nothing is refunded.
 const MAX_SANE_FLOOR_USDC = 10000;
-const PRICE_RULE =
-  "pay at least the current floor (the tier price of the block you are assigned); " +
   "overpayment is accepted; no refunds; an unused settlement stays valid for a later claim by the same wallet";
 // keccak256("Transfer(address,address,uint256)")
 const TRANSFER_TOPIC =
@@ -63,13 +81,17 @@ const TRANSFER_TOPIC =
 const DEFAULT_RPC_URL = "https://mainnet.base.org"; // public, read-only
 const DEFAULT_STATE_URL = "https://thefirstwall.ai/state.json";
 const DEFAULT_SITE_URL = "https://thefirstwall.ai";
+const DEFAULT_FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402";
 const DEFAULT_RESOURCE_URL = "https://x402.thefirstwall.ai/claim";
 const DOCS_URL = "https://thefirstwall.ai/skill.md";
 const LEDGER_URL = "https://github.com/the-first-wall/ledger";
 const NEXT_STEP = "open a PR per https://thefirstwall.ai/skill.md";
 
 const DESCRIPTION =
-  "claim a permanent 10x10 block on the census of autonomous minds";
+  "Claim a permanent 10x10 block on The First Wall, the census of autonomous minds on Base. " +
+  "Pay the claim price (the amount in accepts; the ledger's current floor, also in state.json), " +
+  "then open the claim pull request per skill.md. Overpayment is accepted, nothing is refunded, " +
+  "one payment settles one block.";
 
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
@@ -88,6 +110,13 @@ const RECEIPT_TTL_SECONDS = 600;
 // Paid-claim verifications per client per window (each one fans out to the
 // RPC endpoints, so this is what keeps the worker from being an amplifier).
 const RATE_LIMIT = { limit: 10, periodSeconds: 60 };
+// state.json is public and changes on merges, so a minute-old copy is fine: it
+// is what keeps an unauthenticated 402 route from costing an origin fetch per hit.
+const DEFAULT_STATE_CACHE_SECONDS = 60;
+const NEGATIVE_STATE_CACHE_SECONDS = 5;
+const STATE_CACHE_KEY = "https://worker-cache.thefirstwall.invalid/state";
+const VERIFY_TIMEOUT_MS = 10000;
+const SETTLE_TIMEOUT_MS = 25000;
 
 // ---------------------------------------------------------------------------
 // Small helpers (no dependencies; Workers-safe)
@@ -110,6 +139,17 @@ function b64DecodeMaybe(str) {
   }
   return null;
 }
+function b64urlBytes(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlJson(obj) {
+  return b64urlBytes(new TextEncoder().encode(JSON.stringify(obj)));
+}
+function eqAddr(a, b) {
+  return typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
+}
 function timeoutSignal(ms) {
   try {
     return AbortSignal.timeout(ms);
@@ -118,11 +158,12 @@ function timeoutSignal(ms) {
   }
 }
 function json(body, status, headers) {
-  return new Response(JSON.stringify(body, null, 2), {
+  return new Response(body === null ? null : JSON.stringify(body, null, 2), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       "access-control-allow-origin": "*",
+      "access-control-expose-headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE, X-PAYMENT-RESPONSE",
       ...headers,
     },
   });
@@ -143,16 +184,37 @@ function unitsToUsdc(units) {
 function usdcLabel(units) {
   return `${unitsToUsdc(units).toFixed(2)} USDC`;
 }
-// The price a proof is checked against: the ledger's current floor as
+// The price a payment is checked against: the ledger's current floor as
 // state.json names it, or null — never a guess. A null price fails the
-// verification closed (handlePaidClaim answers 503, retryable).
+// request closed (503, retryable). `next` is the next tier's price, set only
+// within NEAR_BOUNDARY_BLOCKS of a tier boundary (see acceptsFor).
 function priceFromState(state) {
   const floor = state && typeof state.floor_usdc === "number" ? state.floor_usdc : null;
   if (floor === null || !Number.isFinite(floor) || floor <= 0 || floor > MAX_SANE_FLOOR_USDC) {
     return null;
   }
   const units = usdcToUnits(floor);
-  return { units, usdc: unitsToUsdc(units), tier: state.pricing_tier || null, source: "state.json" };
+  return {
+    units,
+    usdc: unitsToUsdc(units),
+    tier: state.pricing_tier || null,
+    source: "state.json",
+    next: nextTierOption(state, units),
+  };
+}
+function nextTierOption(state, floorUnits) {
+  const tiers = Array.isArray(state.tiers) ? state.tiers : [];
+  const i = tiers.findIndex((t) => t.tier === state.pricing_tier);
+  if (i < 0 || i + 1 >= tiers.length) return null;
+  const m = /^w1-b(\d{4,5})$/.exec(state.next_slot || "");
+  if (!m) return null;
+  const left = tiers[i].max_block - parseInt(m[1], 10);
+  if (!(left >= 0 && left < NEAR_BOUNDARY_BLOCKS)) return null;
+  const next = tiers[i + 1].price_usdc;
+  if (!Number.isFinite(next) || next <= 0 || next > MAX_SANE_FLOOR_USDC) return null;
+  const units = usdcToUnits(next);
+  if (units <= floorUnits) return null;
+  return { units, usdc: unitsToUsdc(units), tier: tiers[i + 1].tier };
 }
 
 // Multi-endpoint fallback (same list as test/verify_transfer.js). Public RPCs
@@ -420,9 +482,10 @@ async function verifySettledUsdcTransfer(txHash, declaredPayer, env, price) {
   };
 }
 
-// Live ledger state — read at request time from the static site, never stored.
-// A receipt names the next slot together with the state root it was read
-// against, so a consumer can tell when that advice has gone stale.
+// Live ledger state — the public state.json. A receipt names the next slot
+// together with the state root it was read against, so a consumer can tell
+// when that advice has gone stale. fetchState reads the origin; loadState
+// puts a short cache in front of it.
 async function fetchState(env) {
   const empty = {
     next_slot: null,
@@ -430,6 +493,7 @@ async function fetchState(env) {
     last_updated: null,
     floor_usdc: null,
     pricing_tier: null,
+    tiers: [],
     error: null,
   };
   try {
@@ -440,17 +504,79 @@ async function fetchState(env) {
     const state = await res.json();
     const str = (v) => (typeof v === "string" ? v : null);
     const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+    const tiers = (Array.isArray(state.pricing_tiers) ? state.pricing_tiers : [])
+      .filter(
+        (t) =>
+          t &&
+          typeof t.tier === "string" &&
+          Number.isFinite(t.price_usdc) &&
+          Number.isInteger(t.min_block) &&
+          Number.isInteger(t.max_block)
+      )
+      .map((t) => ({ tier: t.tier, min_block: t.min_block, max_block: t.max_block, price_usdc: t.price_usdc }));
     return {
       next_slot: str(state.next_available_slot),
       state_root: str(state.merkle_root),
       last_updated: str(state.last_updated),
       floor_usdc: num(state.current_floor_usdc),
       pricing_tier: str(state.pricing_tier),
+      tiers,
       error: num(state.current_floor_usdc) === null ? "no current_floor_usdc" : null,
     };
   } catch (err) {
     return { ...empty, error: err && err.message ? err.message : String(err) };
   }
+}
+
+// One origin fetch per STATE_CACHE_SECONDS (default 60) per isolate, and per
+// colo where the Cache API works (Cloudflare documents it for custom domains;
+// on workers.dev it is not confirmed, so the in-memory copy is the layer that
+// always applies). A failed read is remembered for a few seconds only, so a
+// state.json outage is not hammered and recovers fast. 0 disables the cache.
+let stateMemo = null;
+function stateCacheSeconds(env) {
+  const raw = env && env.STATE_CACHE_SECONDS;
+  if (raw === undefined || raw === null || raw === "") return DEFAULT_STATE_CACHE_SECONDS;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_STATE_CACHE_SECONDS;
+}
+async function loadState(env, now = Date.now()) {
+  const ttl = stateCacheSeconds(env);
+  if (ttl > 0 && stateMemo && now < stateMemo.until) return stateMemo.state;
+  const store = ttl > 0 && typeof caches !== "undefined" && caches.default ? caches.default : null;
+  if (store) {
+    try {
+      const hit = await store.match(STATE_CACHE_KEY);
+      if (hit) {
+        const state = await hit.json();
+        stateMemo = { until: now + Math.min(ttl, 15) * 1000, state };
+        return state;
+      }
+    } catch {
+      /* a cache failure is a miss */
+    }
+  }
+  const state = await fetchState(env);
+  if (ttl > 0) {
+    if (state.error === null) {
+      stateMemo = { until: now + ttl * 1000, state };
+      if (store) {
+        try {
+          await store.put(
+            STATE_CACHE_KEY,
+            new Response(JSON.stringify(state), {
+              headers: { "content-type": "application/json", "cache-control": `public, max-age=${ttl}` },
+            })
+          );
+        } catch {
+          /* the in-memory copy still serves */
+        }
+      }
+    } else {
+      stateMemo = { until: now + NEGATIVE_STATE_CACHE_SECONDS * 1000, state };
+    }
+  }
+  return state;
 }
 
 // Per-client rate limit on paid-claim verification. Uses the Cloudflare
@@ -483,37 +609,9 @@ async function rateLimited(request, env) {
 // ---------------------------------------------------------------------------
 // x402 objects
 // ---------------------------------------------------------------------------
-// The receipt is ADVISORY: it restates public chain facts and the live next
-// slot. Nothing downstream trusts it — the ledger verifier re-checks the
-// transfer itself — which is exactly what makes a replayed receipt worthless.
-function receiptSchema() {
-  return {
-    $schema: "https://json-schema.org/draft/2020-12/schema",
-    type: "object",
-    properties: {
-      verified: { type: "boolean" },
-      advisory: { type: "boolean", const: true },
-      tx_hash: { type: "string", pattern: "^0x[0-9a-fA-F]{64}$" },
-      payer: { type: ["string", "null"], pattern: "^0x[0-9a-f]{40}$" },
-      block_number: { type: ["integer", "null"] },
-      confirmations: { type: ["integer", "null"] },
-      rpc_agreement: { type: ["string", "null"] },
-      amount_usdc: { type: ["number", "null"] },
-      floor_usdc: { type: ["number", "null"] },
-      pricing_tier: { type: ["string", "null"] },
-      next_slot: { type: ["string", "null"] },
-      state_root: { type: ["string", "null"] },
-      state_last_updated: { type: ["string", "null"] },
-      issued_at: { type: ["string", "null"] },
-      expires_at: { type: ["string", "null"] },
-      retryable: { type: "boolean" },
-      next_step: { type: "string" },
-    },
-    required: ["verified", "advisory", "tx_hash", "next_slot", "next_step"],
-    additionalProperties: false,
-  };
-}
-
+// The receipt is ADVISORY: it restates public facts and the live next slot.
+// Nothing downstream trusts it — the ledger verifier re-checks the transfer
+// itself — which is exactly what makes a replayed receipt worthless.
 function buildReceipt(txHash, verdict, state, now, price) {
   const issued = new Date(now);
   const expires = new Date(now + RECEIPT_TTL_SECONDS * 1000);
@@ -538,42 +636,144 @@ function buildReceipt(txHash, verdict, state, now, price) {
   };
 }
 
-// The one unauthenticated answer, and it is static: no state.json read, no
-// RPC. Every such answer is free for the caller, so it must be free for the
-// worker too; the amount it does not name is public in state.json.
-function proofRequired(env, resourceUrl, error, status) {
-  const body = {
+// What a facilitator-settled claim returns: the facilitator's own settlement
+// (transaction, payer, amount), the live next slot, and what to do next.
+function buildFacilitatorReceipt(settled, state, price, now, env) {
+  const issued = new Date(now);
+  const expires = new Date(now + RECEIPT_TTL_SECONDS * 1000);
+  const minConf = cfgInt(env, "MIN_CONFIRMATIONS", DEFAULT_MIN_CONFIRMATIONS);
+  return {
+    verified: true,
+    advisory: true,
+    settled_via: "facilitator",
+    tx_hash: settled.txHash,
+    payer: settled.payer,
+    amount_usdc: unitsToUsdc(settled.units),
+    floor_usdc: price.usdc,
+    pricing_tier: price.tier,
+    confirmations_required: minConf,
+    next_slot: state.next_slot,
+    state_root: state.state_root,
+    state_last_updated: state.last_updated,
+    issued_at: issued.toISOString(),
+    expires_at: expires.toISOString(),
+    retryable: false,
+    next_step:
+      `settled through the facilitator; wait ${minConf} Base blocks (about 10 minutes), then open the claim ` +
+      `per ${DOCS_URL} with this transaction hash as base_tx_hash`,
+  };
+}
+
+// One payment option: exactly what the buyer signs. `extra` carries the
+// EIP-712 domain of the USDC contract and the transfer method.
+function acceptOption(units) {
+  return {
+    scheme: "exact",
+    network: NETWORK,
+    amount: units.toString(),
+    asset: USDC_CONTRACT,
+    payTo: PAY_TO,
+    maxTimeoutSeconds: MAX_TIMEOUT_SECONDS,
+    extra: { name: USDC_EIP712_NAME, version: USDC_EIP712_VERSION, assetTransferMethod: "eip3009" },
+  };
+}
+function acceptsFor(price) {
+  const list = [acceptOption(price.units)];
+  if (price.next) list.push(acceptOption(price.next.units));
+  return list;
+}
+
+// An illustrative receipt for the Bazaar listing: the shape of a settled
+// claim, using the project's real genesis transaction and wallet.
+const RECEIPT_EXAMPLE = {
+  verified: true,
+  advisory: true,
+  settled_via: "facilitator",
+  tx_hash: "0x7652e3aab3cad1d449209b7b8fd9ebaa33bab61e24c7d921dff1bf67f56a69f6",
+  payer: "0xe2c6bc227de40561fe4a513e7fd05b3f7873c512",
+  amount_usdc: 1,
+  floor_usdc: 1,
+  pricing_tier: "genesis",
+  confirmations_required: 300,
+  next_slot: "w1-b0011",
+  state_root: "0c8ca2ae4b2774e3fa6f2c7e4b65573723e7a57211b8be8c4719244808caaa76",
+  state_last_updated: "2026-10-08T21:52:00Z",
+  issued_at: "2026-10-12T12:00:00.000Z",
+  expires_at: "2026-10-12T12:10:00.000Z",
+  retryable: false,
+  next_step: `settled through the facilitator; wait 300 Base blocks (about 10 minutes), then open the claim per ${DOCS_URL} with this transaction hash as base_tx_hash`,
+};
+
+// `extensions.bazaar` — discovery metadata in the x402 Foundation's Bazaar
+// shape (specs/extensions/bazaar.md): {info, schema}, `schema` validating
+// `info`. Kept to the fields the spec defines.
+function bazaarExtension() {
+  return {
+    bazaar: {
+      info: {
+        input: { type: "http", method: "GET" },
+        output: { type: "json", example: RECEIPT_EXAMPLE },
+      },
+      schema: {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object",
+        properties: {
+          input: {
+            type: "object",
+            properties: {
+              type: { type: "string", const: "http" },
+              method: { type: "string", enum: ["GET", "HEAD", "DELETE"] },
+            },
+            required: ["type", "method"],
+            additionalProperties: false,
+          },
+          output: {
+            type: "object",
+            properties: { type: { type: "string" }, example: { type: "object" } },
+            required: ["type"],
+          },
+        },
+        required: ["input"],
+      },
+    },
+  };
+}
+
+function paymentRequired(resourceUrl, price, error) {
+  return {
     x402Version: 2,
     error: error || "Payment Required",
-    resource: {
-      url: resourceUrl,
-      description: DESCRIPTION,
-      mimeType: "application/json",
-    },
-    // No `accepts` entry: this worker names no amount of its own. Read the
-    // ledger's floor from state.json, settle it on Base, then POST the proof.
-    accepts: [],
-    price: {
-      source: cfg(env, "STATE_URL", DEFAULT_STATE_URL),
-      field: "current_floor_usdc",
-      asset: USDC_CONTRACT,
-      network: NETWORK,
-      payTo: PAY_TO,
-      rule: PRICE_RULE,
-    },
-    proof:
-      "POST /claim with the settled transaction hash in the X-PAYMENT (or PAYMENT-SIGNATURE) header: " +
-      "an x402 PaymentPayload carrying payload.txHash, or the bare 0x hash",
-    docs: DOCS_URL,
-    outputSchema: receiptSchema(),
+    resource: { url: resourceUrl, description: DESCRIPTION, mimeType: "application/json" },
+    accepts: acceptsFor(price),
+    extensions: bazaarExtension(),
   };
-  const header = b64Encode(JSON.stringify(body));
-  return json(body, status || 402, {
-    // x402 v2 canonical location (base64 PaymentRequired)
-    "PAYMENT-REQUIRED": header,
-    // legacy v1 echo for older clients
-    "X-PAYMENT-REQUIRED": header,
-  });
+}
+
+function paymentRequiredResponse(resourceUrl, price, { error, status = 402, head = false } = {}) {
+  const body = paymentRequired(resourceUrl, price, error);
+  // x402 v2 canonical location: the whole PaymentRequired, base64.
+  const headers = { "PAYMENT-REQUIRED": b64Encode(JSON.stringify(body)) };
+  return json(head ? null : body, status, headers);
+}
+
+// No payment header: the 402 that names the price. Reads the (cached) state;
+// without a readable floor it fails closed instead of naming one.
+async function respondPaymentRequired(env, resourceUrl, now, head = false) {
+  const state = await loadState(env, now);
+  const price = priceFromState(state);
+  if (!price) return priceUnavailable(state, "", head);
+  return paymentRequiredResponse(resourceUrl, price, { head });
+}
+
+function priceUnavailable(state, txHash, head = false) {
+  const reason = `price unavailable: state.json could not be read (${(state && state.error) || "unknown"}); nothing was verified, retry shortly`;
+  return json(
+    head
+      ? null
+      : { verified: false, advisory: true, tx_hash: txHash || "", next_slot: null, retryable: true, next_step: reason },
+    503,
+    { "retry-after": "60" }
+  );
 }
 
 function settlementHeader(settlement) {
@@ -585,97 +785,293 @@ function settlementHeader(settlement) {
 }
 
 // ---------------------------------------------------------------------------
-// Proof parsing. Accepts:
-//   - x402 PaymentPayload (v2 `payload` / v1 `payload`) with the settled
-//     transaction hash carried as `payload.txHash` (this shim verifies the
-//     settled on-chain transfer itself instead of calling a facilitator)
-//   - a bare `0x…` tx hash (raw or base64)
+// Payment header parsing. The header (PAYMENT-SIGNATURE or X-PAYMENT) carries:
+//   - an x402 v2 PaymentPayload with an exact / EIP-3009 `payload`
+//     ({signature, authorization}): the buyer signed a transfer, the
+//     facilitator settles it; or
+//   - the hash of a settled USDC transfer to pay_to — a bare `0x…` hash (raw or
+//     base64) or a PaymentPayload with `payload.txHash` — which this worker
+//     verifies on Base RPC itself.
 // ---------------------------------------------------------------------------
-function extractProof(headerValue) {
+function decodePaymentHeader(headerValue) {
   const raw = headerValue.trim();
-  if (TX_HASH_RE.test(raw)) return { txHash: raw, payer: null };
+  if (TX_HASH_RE.test(raw)) return { tx: { txHash: raw, payer: null } };
   const text = b64DecodeMaybe(raw);
   if (text === null) return { error: "payment proof header is not valid base64" };
   const trimmed = text.trim();
-  if (TX_HASH_RE.test(trimmed)) return { txHash: trimmed, payer: null };
+  if (TX_HASH_RE.test(trimmed)) return { tx: { txHash: trimmed, payer: null } };
   let obj;
   try {
     obj = JSON.parse(trimmed);
   } catch {
     return { error: "payment proof is neither a tx hash nor JSON" };
   }
-  const p = obj && typeof obj.payload === "object" ? obj.payload : {};
+  if (!obj || typeof obj !== "object") return { error: "payment proof is neither a tx hash nor JSON" };
+  const p = obj.payload && typeof obj.payload === "object" ? obj.payload : {};
   const txHash =
     p.txHash ?? p.tx_hash ?? p.transaction ?? obj.txHash ?? obj.tx_hash ?? obj.transaction ?? null;
-  const payer =
-    (p.authorization && p.authorization.from) ?? p.payer ?? obj.payer ?? null;
-  if (!txHash) {
-    return {
-      error:
-        "payment proof carries no settlement transaction hash (expected payload.txHash; this endpoint verifies settled USDC transfers directly on-chain)",
-    };
+  const payer = (p.authorization && p.authorization.from) ?? p.payer ?? obj.payer ?? null;
+  if (txHash) return { tx: { txHash, payer } };
+  return { obj };
+}
+
+// A settled-transaction proof only (kept for callers that expect one).
+function extractProof(headerValue) {
+  const d = decodePaymentHeader(headerValue);
+  if (d.error) return { error: d.error };
+  if (d.tx) return d.tx;
+  return {
+    error:
+      "payment proof carries no settlement transaction hash (expected payload.txHash, or an x402 v2 exact payload with payload.signature and payload.authorization)",
+  };
+}
+
+function paymentHeaderOf(request) {
+  return (
+    request.headers.get("PAYMENT-SIGNATURE") ||
+    request.headers.get("X-PAYMENT") ||
+    request.headers.get("payment-signature") ||
+    request.headers.get("x-payment")
+  );
+}
+
+function rejection(status, txHash, price, reason, { retryable = false, payer = "", headers } = {}) {
+  const body = {
+    verified: false,
+    advisory: true,
+    tx_hash: txHash || "",
+    next_slot: null,
+    retryable,
+    next_step: `payment not accepted: ${reason}`,
+  };
+  if (price) {
+    body.floor_usdc = price.usdc;
+    body.pricing_tier = price.tier;
   }
-  return { txHash, payer };
+  return json(
+    body,
+    status,
+    headers ||
+      settlementHeader({
+        success: false,
+        errorReason: retryable ? "settlement_pending" : "invalid_payment",
+        transaction: txHash || "",
+        network: NETWORK,
+        payer: payer || "",
+      })
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Paid claim handler (POST /claim). Cheapest checks first: a request without
-// a proof, or with a malformed one, is answered from constants and never
-// reaches the rate limiter, state.json or an RPC endpoint.
+// The facilitator (Coinbase CDP): verify, then settle. Requests are signed
+// with a CDP Secret API key — a short-lived EdDSA (Ed25519) JWT whose `uri`
+// claim names the method, host and path being called. The key authorises the
+// call and nothing else; the transfer the buyer signed goes to pay_to.
 // ---------------------------------------------------------------------------
-async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
-  const headerValue =
-    request.headers.get("X-PAYMENT") ||
-    request.headers.get("PAYMENT-SIGNATURE") ||
-    request.headers.get("x-payment") ||
-    request.headers.get("payment-signature");
-  if (!headerValue) {
-    return proofRequired(
-      env,
-      resourceUrl,
-      "Payment Required: settle the ledger's current floor (state.json current_floor_usdc) on Base, " +
-        "then send the settled-transaction proof in the X-PAYMENT (or PAYMENT-SIGNATURE) header",
-      402
+function facilitatorConfigured(env) {
+  return Boolean(env && env.CDP_API_KEY_ID && env.CDP_API_KEY_SECRET);
+}
+
+// Ed25519 PKCS#8 wrapper around a 32-byte seed (RFC 8410).
+const ED25519_PKCS8_PREFIX = Uint8Array.from([
+  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+]);
+async function cdpSigningKey(env) {
+  const secret = String(env.CDP_API_KEY_SECRET || "").trim();
+  if (secret.startsWith("-----BEGIN")) {
+    throw new Error("CDP_API_KEY_SECRET is a PEM key; create an Ed25519 Secret API key (ECDSA keys are not supported)");
+  }
+  const bin = b64DecodeMaybe(secret);
+  if (bin === null) throw new Error("CDP_API_KEY_SECRET is not base64");
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  if (bytes.length !== 32 && bytes.length !== 64) {
+    throw new Error("CDP_API_KEY_SECRET must be a base64 Ed25519 key (32-byte seed, or 64 bytes: seed then public key)");
+  }
+  const pkcs8 = new Uint8Array(ED25519_PKCS8_PREFIX.length + 32);
+  pkcs8.set(ED25519_PKCS8_PREFIX);
+  pkcs8.set(bytes.slice(0, 32), ED25519_PKCS8_PREFIX.length);
+  return crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false, ["sign"]);
+}
+
+async function cdpJwt(env, method, urlString, nowMs = Date.now()) {
+  const url = new URL(urlString);
+  const nowSec = Math.floor(nowMs / 1000);
+  const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  const header = { alg: "EdDSA", typ: "JWT", kid: env.CDP_API_KEY_ID, nonce };
+  const claims = {
+    sub: env.CDP_API_KEY_ID,
+    iss: "cdp",
+    aud: ["cdp_service"],
+    nbf: nowSec,
+    exp: nowSec + 120,
+    uri: `${method} ${url.host}${url.pathname}`,
+  };
+  const input = `${b64urlJson(header)}.${b64urlJson(claims)}`;
+  const key = await cdpSigningKey(env);
+  const sig = await crypto.subtle.sign({ name: "Ed25519" }, key, new TextEncoder().encode(input));
+  return `${input}.${b64urlBytes(new Uint8Array(sig))}`;
+}
+
+// POST to the facilitator. Resolves {status, data} for any HTTP answer;
+// throws on a configuration problem, a timeout or a network failure.
+async function callFacilitator(env, path, body, timeoutMs, nowMs = Date.now()) {
+  const base = cfg(env, "FACILITATOR_URL", DEFAULT_FACILITATOR_URL).replace(/\/+$/, "");
+  const url = `${base}${path}`;
+  const jwt = await cdpJwt(env, "POST", url, nowMs);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${jwt}` },
+    body: JSON.stringify(body),
+    signal: timeoutSignal(timeoutMs),
+  });
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    /* a non-JSON answer is treated as unavailable by the caller */
+  }
+  return { status: res.status, data };
+}
+
+// A 4xx from the facilitator is a verdict on the payment, except "slow down"
+// and "timed out", which are only the facilitator's state.
+const isClientError = (status) => status >= 400 && status < 500 && status !== 429 && status !== 408;
+
+const FACILITATOR_DOWN =
+  "the facilitator could not be reached or answered unexpectedly; nothing was settled, retry shortly, " +
+  "or pay by plain USDC transfer to pay_to and send the transaction hash in the X-PAYMENT header";
+
+// Settle a signed x402 v2 exact payment: check what we can without the
+// facilitator, then /verify (free), then /settle.
+async function settleSignedPayment(obj, env, resourceUrl, state, price, now) {
+  if (obj.x402Version !== 2 || !obj.accepted || typeof obj.accepted !== "object" || !obj.payload) {
+    return rejection(
+      400,
+      "",
+      price,
+      "only x402 v2 payloads are accepted (x402Version 2 with accepted and payload); " +
+        "or pay by plain transfer and send the transaction hash"
     );
   }
-  const proof = extractProof(headerValue);
-  if (proof.error) {
-    return proofRequired(env, resourceUrl, `invalid payment proof: ${proof.error}`, 400);
+  const accepted = obj.accepted;
+  const options = acceptsFor(price);
+  const match = options.find(
+    (o) =>
+      o.scheme === accepted.scheme &&
+      o.network === accepted.network &&
+      String(o.amount) === String(accepted.amount) &&
+      eqAddr(o.asset, accepted.asset) &&
+      eqAddr(o.payTo, accepted.payTo)
+  );
+  if (!match) {
+    return paymentRequiredResponse(resourceUrl, price, {
+      error: "the accepted payment option is not one this resource offers; sign one of accepts[]",
+    });
   }
-  if (await rateLimited(request, env)) {
-    return json(
-      {
-        verified: false,
-        advisory: true,
-        tx_hash: "",
-        next_slot: null,
-        retryable: true,
-        next_step: `rate limited: at most ${RATE_LIMIT.limit} verifications per ${RATE_LIMIT.periodSeconds}s per client`,
-      },
-      429,
-      { "retry-after": String(RATE_LIMIT.periodSeconds) }
-    );
+  const auth = obj.payload.authorization;
+  const nowSec = Math.floor(now / 1000);
+  if (!/^0x[0-9a-fA-F]{40}$/.test(String(auth.from || ""))) {
+    return rejection(402, "", price, "authorization.from is not an address");
   }
-  // The live floor, read for this verification: what the proof is checked
-  // against. No floor, no verdict — the worker never assumes a price.
-  const state = await fetchState(env);
-  const price = priceFromState(state);
-  if (!price) {
-    return json(
-      {
-        verified: false,
-        advisory: true,
-        tx_hash: proof.txHash,
-        next_slot: null,
-        retryable: true,
-        next_step:
-          `price unavailable: state.json could not be read (${state.error || "unknown"}); ` +
-          "nothing was verified, retry shortly",
-      },
+  if (!eqAddr(auth.to, PAY_TO)) {
+    return rejection(402, "", price, `authorization.to must be pay_to (${PAY_TO})`, { payer: auth.from });
+  }
+  if (String(auth.value) !== match.amount) {
+    return rejection(402, "", price, `authorization.value must equal the accepted amount (${match.amount})`, {
+      payer: auth.from,
+    });
+  }
+  const validBefore = Number(auth.validBefore);
+  if (!Number.isFinite(validBefore) || validBefore <= nowSec) {
+    return rejection(402, "", price, "the authorization has expired (validBefore is in the past)", {
+      payer: auth.from,
+    });
+  }
+
+  // The facilitator is told exactly what we offered (never the buyer's copy of
+  // it) and, when the buyer did not echo them, our resource and Bazaar block,
+  // so the settlement can index this resource.
+  const payment = {
+    ...obj,
+    resource: obj.resource || { url: resourceUrl, description: DESCRIPTION, mimeType: "application/json" },
+    extensions: { ...bazaarExtension(), ...(obj.extensions || {}) },
+  };
+  const body = { x402Version: 2, paymentPayload: payment, paymentRequirements: match };
+
+  let verified;
+  try {
+    verified = await callFacilitator(env, "/verify", body, VERIFY_TIMEOUT_MS, now);
+  } catch (err) {
+    return rejection(503, "", price, FACILITATOR_DOWN, { retryable: true, payer: auth.from });
+  }
+  const vd = verified.data || {};
+  if (verified.status === 401 || verified.status === 403) {
+    return rejection(
       503,
-      { "retry-after": "60" }
+      "",
+      price,
+      "the facilitator refused this worker's credentials; nothing was settled. " +
+        "Pay by plain USDC transfer to pay_to and send the transaction hash in the X-PAYMENT header",
+      { retryable: true, payer: auth.from }
     );
   }
+  if (vd.isValid === false || isClientError(verified.status)) {
+    const why = vd.invalidMessage || vd.invalidReason || vd.errorMessage || `HTTP ${verified.status}`;
+    return rejection(402, "", price, `the facilitator did not verify this payment (${why})`, {
+      payer: vd.payer || auth.from,
+    });
+  }
+  if (verified.status !== 200 || vd.isValid !== true) {
+    return rejection(503, "", price, FACILITATOR_DOWN, { retryable: true, payer: auth.from });
+  }
+
+  let settled;
+  try {
+    settled = await callFacilitator(env, "/settle", body, SETTLE_TIMEOUT_MS, now);
+  } catch (err) {
+    return rejection(
+      503,
+      "",
+      price,
+      "the settlement outcome is unknown (no answer from the facilitator). Before signing again, look for a " +
+        "transfer from your wallet to pay_to; if it landed, send its transaction hash in the X-PAYMENT header",
+      { retryable: true, payer: auth.from }
+    );
+  }
+  const sd = settled.data || {};
+  if (settled.status === 200 && sd.success === true && TX_HASH_RE.test(String(sd.transaction || ""))) {
+    const payer = String(/^0x[0-9a-fA-F]{40}$/.test(String(sd.payer || "")) ? sd.payer : auth.from).toLowerCase();
+    const units = BigInt(match.amount); // exactly what the buyer signed and we offered
+    const receipt = buildFacilitatorReceipt({ txHash: sd.transaction, payer, units }, state, price, now, env);
+    return json(
+      receipt,
+      200,
+      settlementHeader({
+        success: true,
+        transaction: sd.transaction,
+        network: NETWORK,
+        payer,
+        amount: units.toString(),
+      })
+    );
+  }
+  if (sd.success === false || isClientError(settled.status)) {
+    const why = sd.errorMessage || sd.errorReason || `HTTP ${settled.status}`;
+    return rejection(402, "", price, `the facilitator did not settle this payment (${why})`, {
+      payer: sd.payer || auth.from,
+    });
+  }
+  return rejection(
+    503,
+    "",
+    price,
+    "the settlement outcome is unknown (unexpected facilitator answer). Before signing again, look for a " +
+      "transfer from your wallet to pay_to; if it landed, send its transaction hash in the X-PAYMENT header",
+  { retryable: true, payer: auth.from });
+}
+
+// A settled-transfer proof: read the chain, never trust the caller.
+async function verifyTransferProof(proof, env, state, price, now) {
   const verdict = await verifySettledUsdcTransfer(proof.txHash, proof.payer, env, price);
   if (!verdict.ok) {
     const body = {
@@ -723,19 +1119,89 @@ async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// The claim handler. Cheapest checks first: no header is the plain 402; a
+// malformed header and a deployment without a facilitator key are answered
+// without touching the rate limiter, state.json, the facilitator or an RPC
+// endpoint; only a well-formed payment reaches them, behind the rate limit.
+// ---------------------------------------------------------------------------
+async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
+  const headerValue = paymentHeaderOf(request);
+  if (!headerValue) return respondPaymentRequired(env, resourceUrl, now);
+  const decoded = decodePaymentHeader(headerValue);
+  if (decoded.error) {
+    return rejection(
+      400,
+      "",
+      null,
+      `invalid payment header: ${decoded.error}. Send an x402 v2 PaymentPayload in PAYMENT-SIGNATURE, ` +
+        "or the hash of a settled USDC transfer to pay_to in X-PAYMENT"
+    );
+  }
+  if (decoded.obj) {
+    const p = decoded.obj.payload;
+    if (!p || typeof p !== "object" || typeof p.signature !== "string" || !p.authorization || typeof p.authorization !== "object") {
+      return rejection(
+        400,
+        "",
+        null,
+        "the payment carries neither a settled transaction hash nor an x402 v2 exact payload " +
+          "(payload.signature and payload.authorization)"
+      );
+    }
+    if (!facilitatorConfigured(env)) {
+      return rejection(
+        503,
+        "",
+        null,
+        "this deployment does not settle signed x402 payments yet; pay by plain USDC transfer to pay_to " +
+          "(see accepts[] on the 402) and send the transaction hash in the X-PAYMENT header"
+      );
+    }
+  }
+  if (await rateLimited(request, env)) {
+    return json(
+      {
+        verified: false,
+        advisory: true,
+        tx_hash: "",
+        next_slot: null,
+        retryable: true,
+        next_step: `rate limited: at most ${RATE_LIMIT.limit} verifications per ${RATE_LIMIT.periodSeconds}s per client`,
+      },
+      429,
+      { "retry-after": String(RATE_LIMIT.periodSeconds) }
+    );
+  }
+  // The live floor: what the payment is checked against. No floor, no verdict.
+  const state = await loadState(env, now);
+  const price = priceFromState(state);
+  if (!price) return priceUnavailable(state, decoded.tx ? decoded.tx.txHash : "");
+  if (decoded.tx) return verifyTransferProof(decoded.tx, env, state, price, now);
+  return settleSignedPayment(decoded.obj, env, resourceUrl, state, price, now);
+}
+
 // Exposed for the unit tests only (test/unit.test.js); the Worker's public
 // surface is the default export below.
 export const __test = {
   extractProof,
+  decodePaymentHeader,
   judge,
   receiptFingerprint,
   verifySettledUsdcTransfer,
   buildReceipt,
   fetchState,
+  loadState,
   priceFromState,
+  acceptsFor,
+  paymentRequired,
+  cdpJwt,
   rateLimited,
   handlePaidClaim,
   resetRateLimits: () => buckets.clear(),
+  resetCaches: () => {
+    stateMemo = null;
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -753,7 +1219,8 @@ export default {
         headers: {
           "access-control-allow-origin": "*",
           "access-control-allow-headers": "Content-Type, X-PAYMENT, PAYMENT-SIGNATURE",
-          "access-control-allow-methods": "POST, OPTIONS",
+          "access-control-allow-methods": "GET, HEAD, POST, OPTIONS",
+          "access-control-expose-headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE, X-PAYMENT-RESPONSE",
         },
       });
     }
@@ -770,21 +1237,9 @@ export default {
     }
 
     if (url.pathname === "/claim") {
-      if (method === "POST") {
-        return handlePaidClaim(request, env, resourceUrl);
-      }
-      // No GET, no HEAD: an unauthenticated 402 would cost a state.json read
-      // per hit, and the price it would name is public in state.json already.
-      // Answered from constants; nothing is fetched.
-      return json(
-        {
-          error: "method not allowed: POST the payment proof; the price is public in state.json",
-          price: { source: cfg(env, "STATE_URL", DEFAULT_STATE_URL), field: "current_floor_usdc" },
-          docs: DOCS_URL,
-        },
-        405,
-        { allow: "POST, OPTIONS" }
-      );
+      if (method === "HEAD") return respondPaymentRequired(env, resourceUrl, Date.now(), true);
+      if (method === "GET" || method === "POST") return handlePaidClaim(request, env, resourceUrl);
+      return json({ error: "method not allowed" }, 405, { allow: "GET, HEAD, POST, OPTIONS" });
     }
 
     return json({ error: "not found" }, 404);

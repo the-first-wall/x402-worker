@@ -1,11 +1,17 @@
-# The First Wall — x402 claim verifier
+# The First Wall — x402 claim endpoint
 # =====================================
 # Deliberately contains NO account-specific identifiers (no account_id, no
 # zone_id, no routes bound to a zone). The operator's Cloudflare account
 # supplies those at deploy time — see README.md "Operator TODO".
 #
 # This worker is STATELESS and CUSTODY-FREE: no KV, no D1, no queues, no
-# secrets, no bindings other than the public read-only config below.
+# bindings other than the public config below. Its one credential, the CDP
+# facilitator key, is NOT in this file: it is set with
+#   npx wrangler secret put CDP_API_KEY_ID
+#   npx wrangler secret put CDP_API_KEY_SECRET
+# (an Ed25519 Secret API key from the CDP portal; see README.md, Deployment).
+# Without them the worker still serves the 402 and verifies plain transfers;
+# it only declines to settle signed x402 payments.
 
 name = "thefirstwall-x402"
 main = "index.js"
@@ -18,12 +24,17 @@ compatibility_date = "2026-10-01"
 # endpoints (publicnode, 1rpc) are hardcoded in index.js rpcUrls().
 RPC_URL = "https://mainnet.base.org"
 # Live ledger-derived state (static site) — the worker reads `next_available_slot`,
-# `current_floor_usdc` and `pricing_tier` from here for every verification (the
-# price it checks against) and never stores them. There is no fallback price:
-# when this cannot be read, a verification fails closed (503, retryable).
-# Only a POST carrying a well-formed proof reads it; GET /claim and a POST
-# without a proof are answered from constants.
+# `current_floor_usdc`, `pricing_tier` and `pricing_tiers` from here (the price it
+# names and checks against) and never stores them beyond the short cache below.
+# There is no fallback price: when this cannot be read, the answer is 503
+# (retryable).
 STATE_URL = "https://thefirstwall.ai/state.json"
+# How long a read of state.json is reused (seconds): one origin fetch per
+# window per isolate, and per colo where the Cache API applies (a custom
+# domain). 0 turns the cache off.
+STATE_CACHE_SECONDS = "60"
+# The x402 facilitator that verifies and settles signed payments (Coinbase CDP).
+FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
 SITE_URL = "https://thefirstwall.ai"
 # The public URL this worker is served from. MUST match the deployed URL so the
 # x402 `resource.url` is accurate.
@@ -42,7 +53,7 @@ RPC_QUORUM = "2"
 # Uncomment and adjust once the zone is on the deploying account:
 # routes = [{ pattern = "x402.thefirstwall.ai/*", custom_domain = true }]
 
-# Optional: Cloudflare rate-limiting binding for proof verification (per colo). Without
+# Optional: Cloudflare rate-limiting binding for payments (per colo). Without
 # it the worker falls back to a per-isolate token bucket (10 per minute per
 # client IP). Check the current syntax in the Cloudflare docs before enabling:
 # https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
