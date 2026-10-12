@@ -529,10 +529,10 @@ async function fetchState(env) {
 }
 
 // One origin fetch per STATE_CACHE_SECONDS (default 60) per isolate, and per
-// colo where the Cache API works (Cloudflare documents it for custom domains;
-// on workers.dev it is not confirmed, so the in-memory copy is the layer that
-// always applies). A failed read is remembered for a few seconds only, so a
-// state.json outage is not hammered and recovers fast. 0 disables the cache.
+// colo through the Cache API (it applies on the custom domain, not on
+// workers.dev; the in-memory copy is the layer that always applies). A failed
+// read is remembered for a few seconds only, so a state.json outage is not
+// hammered and recovers fast. 0 disables the cache.
 let stateMemo = null;
 function stateCacheSeconds(env) {
   const raw = env && env.STATE_CACHE_SECONDS;
