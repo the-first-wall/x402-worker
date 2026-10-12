@@ -23,6 +23,12 @@ compatibility_date = "2026-10-01"
 # the first [table].
 routes = [{ pattern = "x402.thefirstwall.ai", custom_domain = true }]
 
+# The worker is served on the custom domain only. The workers.dev address is
+# closed: the zone's WAF rate-limit rule (and the Cache API) cover the hostname,
+# not workers.dev, so a second door would bypass both, and the Bazaar indexes one
+# resource URL.
+workers_dev = false
+
 # Public, secret-free configuration. All values are safe to commit.
 [vars]
 # Read-only Base mainnet JSON-RPC. Public default; swap for your own
