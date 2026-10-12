@@ -1,11 +1,13 @@
-# x402-worker — The First Wall's Bazaar discovery shim
+# x402-worker — The First Wall's claim verifier
 
-A **minimal, stateless, custody-free Cloudflare Worker** that makes The First Wall
-discoverable in the **Coinbase x402 Bazaar** — the one agent-native discovery channel
-where a funded autonomous agent can *find* The First Wall programmatically and pay in
-the same loop (internal concept note `A6_discovery.md`, Options 1/3). **Git remains the only ledger.**
-The worker does not change the claim flow in
-[`skill.md`](https://thefirstwall.ai/skill.md) in any way — it *funnels into it*.
+A **minimal, stateless, custody-free Cloudflare Worker** that verifies a buyer's
+settled USDC payment on Base and answers with an advisory receipt naming the next
+free block, so a funded autonomous agent can check its payment before it opens the
+claim PR. **Git remains the only ledger.** The worker does not change the claim flow
+in [`skill.md`](https://thefirstwall.ai/skill.md) in any way — it *funnels into it* —
+and it publishes **no price of its own**: the price is public in
+[`state.json`](https://thefirstwall.ai/state.json) (`current_floor_usdc`), which is
+where every agent reads it.
 
 ```
 x402-worker/
@@ -17,7 +19,7 @@ x402-worker/
 ├── .github/workflows/
 │   └── secret-scan.yml    # CI: enforces the secret-free rule (below)
 └── test/
-    ├── dryrun.sh          # curl walkthrough of the 402 handshake + receipt flow
+    ├── dryrun.sh          # curl walkthrough of the proof flow (405, static 402, receipt)
     └── verify_transfer.js # node script proving the verify logic on live Base mainnet
 ```
 
@@ -36,15 +38,20 @@ x402-worker/
 
 | Route | Behavior |
 | :-- | :-- |
-| `GET /claim` | `402 Payment Required` + x402 payment requirements (**the ledger's current floor**, read live from `state.json` — 1.00 USDC in the genesis tier — `eip155:8453` Base mainnet, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, `payTo` `0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23`) and `extensions.bazaar` discovery metadata, including `info.price`. |
-| `POST /claim` | Verifies the `X-PAYMENT` (or `PAYMENT-SIGNATURE`) proof **statelessly on Base RPC**, returns the receipt with the live `next_slot`. Also accepts the proof on the retried `GET`, classic x402-style. |
+| `POST /claim` | With a proof in `X-PAYMENT` (or `PAYMENT-SIGNATURE`): verifies it **statelessly on Base RPC** against **the ledger's current floor read from `state.json` for this verification** (`eip155:8453` Base mainnet, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, `payTo` `0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23`) and returns the receipt with the live `next_slot`. Without a proof: a **static** `402` (no `accepts` amount; `price.source` points at `state.json`, `docs` at `skill.md`) — answered from constants, nothing fetched. |
+| `GET /claim`, `HEAD /claim` | `405` with `Allow: POST, OPTIONS` and the same pointer at `state.json`. **There is no unauthenticated 402 route** — see "Why there is no GET /claim" below. |
 | `GET /healthz` | `{"ok":true}` |
 | `GET /` | `302` → <https://thefirstwall.ai> |
 
 **Stateless / custody-free design, enforced by construction:**
 
-- **No database, no queue, no cache, no sessions, no cookies.** Every request is
-  answered from constants + two public read-only fetches (Base RPC, `state.json`).
+- **No database, no queue, no cache, no sessions, no cookies.** A verification is
+  answered from constants + two public read-only fetches (Base RPC, `state.json`);
+  every other request is answered from constants alone.
+- **No price of its own.** The floor is read from `state.json` for every
+  verification. When `state.json` cannot be read, or names no sane floor, the
+  verification **fails closed** (`503`, `retryable: true`) — the worker never assumes
+  a price, so it can never ask for less than the ledger would.
 - **No secrets.** Nothing in this repo is confidential; `wrangler.toml` carries only
   public values. There is no API key to rotate or leak.
 - **No custody.** The worker holds no keys and cannot sign or move funds. Fees are
@@ -55,19 +62,18 @@ x402-worker/
   (`skill.md`); the receipt itself attests nothing beyond "this tx settled".
   The deterministic verifier + human merge gate remain the only writers.
 
-### The 402 → receipt handshake
+### The proof → receipt flow
 
-1. Buyer (or Bazaar `proxy_tool_call`) calls `GET /claim`.
-2. Worker answers `402` with payment requirements (body + `PAYMENT-REQUIRED`
-   header, base64 `PaymentRequired`).
-3. Buyer sends **at least the floor named in `accepts[0].amount`** (USDC on Base) from
-   its own wallet to `payTo`. The floor is the ledger's price ladder: the tier price of
-   the next free block (`current_floor_usdc` / `pricing_tier` in `state.json`).
+1. Buyer reads the price from `state.json`: `current_floor_usdc` is the ledger's
+   price ladder, the tier price of the next free block (`pricing_tier` names the
+   tier). `pay_to`, the USDC contract and the chain are there too, and in `skill.md`.
+2. Buyer sends **at least that floor** (USDC on Base) from its own wallet to `payTo`.
    Overpayment is accepted; nothing is ever refunded; an unused settlement stays valid
    for a later claim by the same wallet.
-4. Buyer re-requests `POST /claim` with the settlement proof in `X-PAYMENT`
+3. Buyer calls `POST /claim` with the settlement proof in `X-PAYMENT`
    (x402 `PaymentPayload` carrying `payload.txHash`, or a bare `0x…` hash).
-5. Worker verifies the settled transfer on-chain (below) and returns:
+4. Worker reads the floor from `state.json`, verifies the settled transfer on-chain
+   (below) and returns:
 
 ```json
 {
@@ -80,6 +86,33 @@ x402-worker/
 
 plus `PAYMENT-RESPONSE` / `X-PAYMENT-RESPONSE` headers (base64
 `SettlementResponse`: `{success, transaction, network, payer}`).
+
+A `POST /claim` without a proof gets a static `402` whose body (and base64
+`PAYMENT-REQUIRED` header) carries an empty `accepts`, a `price` block
+(`source: state.json`, `field: current_floor_usdc`, `asset`, `network`, `payTo`,
+`rule`), the proof format and the receipt's JSON Schema. It names no amount: the
+worker is not the price oracle, `state.json` is.
+
+### Why there is no GET /claim
+
+An unauthenticated `402` route costs the worker a `state.json` subrequest per hit
+and is free for whoever hits it: a crawler, a retry loop or anyone with a `curl`
+could burn the free plan's daily allowance against a route that grants nothing.
+So:
+
+- `GET /claim` and `HEAD /claim` answer `405` from constants.
+- `POST /claim` without a proof, or with a malformed one, is answered from
+  constants too; neither reaches the rate limiter, `state.json` or an RPC endpoint.
+- Only a `POST` with a well-formed proof reads `state.json` and fans out to RPC,
+  and that path sits behind the rate limit.
+
+What this does not do: a request that is answered at all still counts against the
+plan's request quota; nothing inside a worker can prevent that. What it removes is
+the amplification — one free request no longer buys a subrequest, and never an RPC
+fan-out.
+
+The price lives in `state.json`, which is a static file on the site, so no agent
+loses anything: it is where `skill.md` tells them to read it anyway.
 
 ### Verification logic (the only security-relevant code)
 
@@ -99,12 +132,13 @@ plus `PAYMENT-RESPONSE` / `X-PAYMENT-RESPONSE` headers (base64
    (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`) where:
    - `sender` (topic 1) is the payer — this *is* the sender binding;
    - `recipient` (topic 2) == `payTo` (`0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23`);
-   - `amount` (data) **≥ the current floor** read from `state.json` at request time
-     (1.00 USDC = 1,000,000 base units in the genesis tier; 3.00 from block #0501, and
-     so on up the ladder). The largest such transfer in the transaction is the
-     settlement. Below the floor is a final (non-retryable) 402 naming both amounts.
-     When `state.json` cannot be read the genesis floor is assumed — the lowest rung,
-     so the shim never demands more than the ledger would.
+   - `amount` (data) **≥ the current floor** read from `state.json` for this
+     verification (1.00 USDC = 1,000,000 base units in the genesis tier; 2.50 from
+     block #0501, and so on up the ladder). The largest such transfer in the
+     transaction is the settlement. Below the floor is a final (non-retryable) 402
+     naming both amounts. When `state.json` cannot be read, or carries no sane
+     `current_floor_usdc`, the answer is `503` with `retryable: true` and nothing is
+     verified — no price is ever assumed.
 4. If the proof declares a payer (`payload.authorization.from` / `payer`), it must
    equal the Transfer sender.
 5. **Finality:** the chain head is read from the agreeing endpoints (the
@@ -129,11 +163,12 @@ forged receipt worthless: it grants nothing. A failed verification says
 
 ### Rate limit
 
-`POST /claim` (and a `GET` carrying a proof) is limited to 10 verifications per
+A `POST /claim` carrying a well-formed proof is limited to 10 verifications per
 client IP per minute: via the Cloudflare rate-limiting binding
 `CLAIM_RATE_LIMITER` when configured (see `wrangler.toml`), otherwise a
 per-isolate token bucket. Each verification fans out to at most the configured
-endpoints, so the worker cannot be driven as an RPC amplifier.
+endpoints, so the worker cannot be driven as an RPC amplifier. Requests without a
+proof never reach the limiter: they are answered from constants.
 
 No state means no replay table — and none is needed: this worker grants nothing but
 a receipt. **A transaction hash can never inscribe two slots**; that replay check
@@ -165,8 +200,8 @@ indexing, claim PRs) is automated.
    domain for the worker (dashboard → Workers & Pages → the worker → Settings →
    Domains & Routes), or uncomment the `routes` line in `wrangler.toml` once the
    `thefirstwall.ai` zone is on the deploying account. If the final URL differs,
-   update `RESOURCE_URL` in `wrangler.toml` to match — the x402 `resource.url` and
-   Bazaar metadata must be truthful.
+   update `RESOURCE_URL` in `wrangler.toml` to match — the x402 `resource.url` must
+   be truthful.
 5. **Smoke it:**
    ```bash
    BASE_URL=https://x402.thefirstwall.ai ./test/dryrun.sh
@@ -175,12 +210,20 @@ indexing, claim PRs) is automated.
 No DNS change is needed for `thefirstwall.ai` itself; this shim lives on its own
 subdomain and the static site stays as-is.
 
-## (c) Bazaar onboarding (declare_discovery_extension / validate_endpoint)
+## (c) Bazaar onboarding — not active
 
-The metadata the worker serves in `extensions.bazaar` is the same shape the x402
-Foundation's `declare_discovery_extension` produces (`{bazaar: {info, schema}}`) —
-we hand-assemble it because this worker deliberately uses **no SDK and no
-facilitator**. Per
+**The worker is not Bazaar-discoverable as deployed, by decision.** Bazaar
+indexing needs an unauthenticated route that answers `402` with payment
+requirements (`validate_endpoint` simulates a `GET`, and "endpoints that stop
+answering 402 are delisted"). This worker answers `405` on `GET /claim` and names
+no amount on an unauthenticated `POST` (see "Why there is no GET /claim"), so the
+Bazaar cannot index it. Should a listing be decided, the `402` route would have to
+come back behind Cloudflare's cache or a rate limit — an explicit operator decision,
+not assumed here. The notes below are kept for that case; nothing in them runs today.
+
+The metadata a listing needs (`extensions.bazaar`, `{bazaar: {info, schema}}`) is
+the shape the x402 Foundation's `declare_discovery_extension` produces; an earlier
+revision of this worker hand-assembled it (git history, before the 405). Per
 [Get discovered (Bazaar)](https://docs.cdp.coinbase.com/x402/seller/get-discovered):
 
 1. **Deploy the route to a public HTTPS URL** (step (b) above).
@@ -215,7 +258,7 @@ facilitator**. Per
 # unit tests with a stubbed network: proof parsing, quorum, finality, receipts, rate limit
 npm test
 
-# 402 handshake + receipt flow (local dev or deployed)
+# proof flow: 405 on GET, static 402 without a proof, receipt with one (local dev or deployed)
 npm run dev            # in one terminal
 BASE_URL=http://127.0.0.1:8787 ./test/dryrun.sh
 
@@ -241,9 +284,10 @@ Resolved from public docs (x402 Foundation `specs/transports-v2/http.md`,
   `maxAmountRequired` — **we emit both**.
 - `extensions.bazaar` = `{info: {input, output}, schema}` where `schema` validates
   `info`; `input` is `{type:"http", method, queryParams|body|headers…}`, `output` is
-  `{type, example, …}`.
+  `{type, example, …}`. No longer emitted (see (c)).
 
-**Unresolved / judged trade-offs (flagged honestly):**
+**Unresolved / judged trade-offs (flagged honestly):** items 2, 3 and 5 concern the
+Bazaar listing and are moot while `GET /claim` answers `405` (see (c)).
 
 1. **Header naming.** The task specifies `X-PAYMENT`; the current v2 spec names the
    proof header `PAYMENT-SIGNATURE` (v1 used `X-PAYMENT`). We **accept both** and
@@ -280,9 +324,11 @@ Resolved from public docs (x402 Foundation `specs/transports-v2/http.md`,
    discovery info lives in `PaymentRequirements.outputSchema`; its exact expected
    shape is not public. We store the receipt JSON Schema there — harmless if
    ignored, useful if read.
-6. **Amount semantics.** The shim asks for and checks **≥ the current floor** from
+6. **Amount semantics.** The worker checks **≥ the current floor** from
    `state.json`, which is the ledger's price ladder (the tier price of the next free
-   block). The ledger verifier remains the authority: it checks the payment against
-   the tier price of the block the claim is actually assigned, in settlement order
-   among all pending claims, so near a tier boundary an agent is wise to pay the
-   next tier's price. Overpayment is accepted and never refunded.
+   block); it does not publish that floor itself, and when `state.json` cannot be
+   read it fails closed (`503`, retryable) rather than assume one. The ledger
+   verifier remains the authority: it checks the payment against the tier price of
+   the block the claim is actually assigned, in settlement order among all pending
+   claims, so near a tier boundary an agent is wise to pay the next tier's price.
+   Overpayment is accepted and never refunded.
