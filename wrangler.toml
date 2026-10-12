@@ -1,8 +1,8 @@
 # The First Wall — x402 claim endpoint
 # =====================================
 # Deliberately contains NO account-specific identifiers (no account_id, no
-# zone_id, no routes bound to a zone). The operator's Cloudflare account
-# supplies those at deploy time — see README.md "Operator TODO".
+# zone_id). The operator's Cloudflare account supplies those at deploy time —
+# see README.md "Operator TODO".
 #
 # This worker is STATELESS and CUSTODY-FREE: no KV, no D1, no queues, no
 # bindings other than the public config below. Its one credential, the CDP
@@ -16,6 +16,12 @@
 name = "thefirstwall-x402"
 main = "index.js"
 compatibility_date = "2026-10-01"
+
+# The public hostname. A custom domain needs no zone id: Cloudflare finds the
+# zone from the hostname, on whichever account deploys (the thefirstwall.ai zone
+# is on the operator's account since 2026-10-12). Top-level keys must stay above
+# the first [table].
+routes = [{ pattern = "x402.thefirstwall.ai", custom_domain = true }]
 
 # Public, secret-free configuration. All values are safe to commit.
 [vars]
@@ -37,21 +43,15 @@ STATE_CACHE_SECONDS = "60"
 FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
 SITE_URL = "https://thefirstwall.ai"
 # The public URL this worker is served from. MUST match the deployed URL so the
-# x402 `resource.url` is accurate.
-# INTERIM 2026-10-09: thefirstwall.ai is delegated at GoDaddy (ns03/04.domaincontrol.com)
-# and NOT on this Cloudflare account, so the x402.thefirstwall.ai custom domain
-# cannot be pinned yet. Point at the live workers.dev URL until the zone moves,
-# then flip back to https://x402.thefirstwall.ai/claim and pin the domain below.
-RESOURCE_URL = "https://thefirstwall-x402.thefirstwall.workers.dev/claim"
+# x402 `resource.url` is accurate. The Bazaar indexes a resource by this URL, and
+# the ledger publishes the same one as `links.x402_claim` in state.json
+# (ledger_core.LINKS): change them together.
+RESOURCE_URL = "https://x402.thefirstwall.ai/claim"
 # Settlement finality before a receipt is issued (blocks below the chain head);
 # keep equal to the ledger's state.json `min_confirmations`.
 MIN_CONFIRMATIONS = "300"
 # Independent RPC endpoints that must return the same receipt.
 RPC_QUORUM = "2"
-
-# Operator TODO (after `wrangler login`): pin the custom domain on YOUR account.
-# Uncomment and adjust once the zone is on the deploying account:
-# routes = [{ pattern = "x402.thefirstwall.ai/*", custom_domain = true }]
 
 # Optional: Cloudflare rate-limiting binding for payments (per colo). Without
 # it the worker falls back to a per-isolate token bucket (10 per minute per

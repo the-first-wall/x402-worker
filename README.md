@@ -187,10 +187,10 @@ A `402` route that anyone can call is only safe if answering it is cheap. Three 
 
 1. **Cheap answers.** The `402` needs `state.json`, read **once per
    `STATE_CACHE_SECONDS` (default 60)** per isolate, and per colo through the Cache
-   API where it applies. Cloudflare documents the Cache API for custom domains; on
-   `workers.dev` it is not confirmed, so the in-memory copy is the layer that always
-   works. A failed read is remembered for 5 seconds only. A malformed payment header
-   and a deployment without a facilitator key are answered with no fetch at all.
+   API, which applies on the custom domain (not on `workers.dev`, where the in-memory
+   copy is the layer that works). A failed read is remembered for 5 seconds only. A
+   malformed payment header and a deployment without a facilitator key are answered
+   with no fetch at all.
 2. **A per-client limit on anything that spends.** A well-formed payment is limited to
    10 per client IP per minute, via the Cloudflare rate-limiting binding
    `CLAIM_RATE_LIMITER` when configured (see `wrangler.toml`), otherwise a per-isolate
@@ -198,8 +198,9 @@ A `402` route that anyone can call is only safe if answering it is cheap. Three 
    even `state.json`.
 3. **A rate-limit rule on the hostname** (Cloudflare dashboard → Security → WAF →
    Rate limiting rules) caps raw request counts, which is the only guard for the plan's
-   request quota. It needs the hostname on a zone, i.e. the custom domain; on
-   `workers.dev` it cannot be set, and the plan's own limits are the ceiling.
+   request quota. It applies to `x402.thefirstwall.ai`, which is on a zone; the
+   `workers.dev` address of the same worker is not covered by it (see step 6 of the
+   deployment).
 
 ## (b) Deployment — ⚠️ OPERATOR TODO (the human steps)
 
@@ -231,13 +232,15 @@ everything before (this repo) and after (Bazaar indexing, claim PRs) is automate
    cd x402-worker
    npx wrangler deploy
    ```
-6. **Pin the domain** (recommended; it also enables the Cache API and a WAF rate-limit
-   rule): attach `x402.thefirstwall.ai` as a custom domain for the worker (dashboard →
-   Workers & Pages → the worker → Settings → Domains & Routes), or uncomment the
-   `routes` line in `wrangler.toml` once the `thefirstwall.ai` zone is on the deploying
-   account. If the final URL differs, update `RESOURCE_URL` in `wrangler.toml` to
-   match — the x402 `resource.url` must be truthful. Then add the rate-limit rule on
-   that hostname.
+6. **The domain.** `wrangler.toml` declares `x402.thefirstwall.ai` as a custom domain
+   (`routes`), so `wrangler deploy` attaches it (the `thefirstwall.ai` zone must be on
+   the deploying account; the registrar can stay elsewhere). `RESOURCE_URL` in
+   `wrangler.toml` is the address the 402 advertises and the Bazaar indexes: it must
+   stay truthful, and it is the same URL the ledger publishes as `links.x402_claim` in
+   `state.json` (`LINKS` in the ledger's `scripts/ledger_core.py`), so change both
+   together. Then add the rate-limit rule on that hostname. The same worker still
+   answers on its `workers.dev` address; if the rule should be the only door, set
+   `workers_dev = false` in `wrangler.toml`.
 7. **Smoke it:**
    ```bash
    BASE_URL=https://x402.thefirstwall.ai ./test/dryrun.sh
