@@ -198,9 +198,10 @@ A `402` route that anyone can call is only safe if answering it is cheap. Three 
    even `state.json`.
 3. **A rate-limit rule on the hostname** (Cloudflare dashboard → Security → WAF →
    Rate limiting rules) caps raw request counts, which is the only guard for the plan's
-   request quota. It applies to `x402.thefirstwall.ai`, which is on a zone; the
-   `workers.dev` address of the same worker is not covered by it (see step 6 of the
-   deployment).
+   request quota. It covers `x402.thefirstwall.ai`, the only address the worker answers on
+   (`workers_dev = false`). On the Free plan one rule is included, counted per IP over a
+   10-second period with a 10-second block, for example 20 requests per 10 seconds on the
+   path `/claim`.
 
 ## (b) Deployment — ⚠️ OPERATOR TODO (the human steps)
 
@@ -238,9 +239,10 @@ everything before (this repo) and after (Bazaar indexing, claim PRs) is automate
    `wrangler.toml` is the address the 402 advertises and the Bazaar indexes: it must
    stay truthful, and it is the same URL the ledger publishes as `links.x402_claim` in
    `state.json` (`LINKS` in the ledger's `scripts/ledger_core.py`), so change both
-   together. Then add the rate-limit rule on that hostname. The same worker still
-   answers on its `workers.dev` address; if the rule should be the only door, set
-   `workers_dev = false` in `wrangler.toml`.
+   together. Then add the rate-limit rule on that hostname. `workers_dev = false` closes
+   the `workers.dev` address of the same worker, so the hostname is the only door and the
+   rule covers all of it. (After this deploy the old `workers.dev` URL answers 404 and the
+   Bazaar drops that listing on its own.)
 7. **Smoke it:**
    ```bash
    BASE_URL=https://x402.thefirstwall.ai ./test/dryrun.sh
