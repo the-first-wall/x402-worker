@@ -152,71 +152,95 @@ test("a configured rate-limiting binding takes precedence", async () => {
   assert.equal((await w.handlePaidClaim(post(), bound, "https://x.test/claim")).status, 429);
 });
 
-test("GET /claim still answers 402 with the advisory receipt schema", async () => {
-  const res = await worker.fetch(new Request("https://x.test/claim"), env);
+test("GET /claim is 405 and fetches nothing: the price lives in state.json", async () => {
+  for (const method of ["GET", "HEAD"]) {
+    const res = await worker.fetch(new Request("https://x.test/claim", { method }), env);
+    assert.equal(res.status, 405);
+    assert.equal(res.headers.get("allow"), "POST, OPTIONS");
+  }
+  const body = await (await worker.fetch(new Request("https://x.test/claim"), env)).json();
+  assert.equal(body.price.source, "https://state.test/state.json");
+  assert.equal(body.price.field, "current_floor_usdc");
+  // A proof on GET is not a claim either.
+  assert.equal((await worker.fetch(new Request("https://x.test/claim", { headers: headers() }), env)).status, 405);
+  assert.deepEqual(calls, [], "no state.json read, no RPC");
+  const opts = await worker.fetch(new Request("https://x.test/claim", { method: "OPTIONS" }), env);
+  assert.equal(opts.headers.get("access-control-allow-methods"), "POST, OPTIONS");
+});
+
+test("POST /claim without a proof answers a static 402 that names no amount and fetches nothing", async () => {
+  const res = await worker.fetch(new Request("https://x.test/claim", { method: "POST" }), env);
   assert.equal(res.status, 402);
   const body = await res.json();
-  assert.equal(body.accepts[0].outputSchema.properties.advisory.const, true);
-  assert.equal(body.accepts[0].amount, "1000000");
-  assert.equal(body.extensions.bazaar.info.price.tier, "genesis");
+  assert.deepEqual(body.accepts, []);
+  assert.equal(body.price.source, "https://state.test/state.json");
+  assert.equal(body.price.field, "current_floor_usdc");
+  assert.equal(body.price.payTo, "0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23");
+  assert.match(body.price.rule, /no refunds/);
+  assert.equal(body.outputSchema.properties.advisory.const, true);
   assert.ok(res.headers.get("PAYMENT-REQUIRED"));
-});
-
-// --- the price ladder (R-10): the floor comes from the ledger's state.json ---
-
-test("GET /claim asks for the ledger's current floor, not a constant", async () => {
-  plan.state = { ...plan.state, next_available_slot: "w1-b0501", current_floor_usdc: 3.0, pricing_tier: "tier-2" };
-  const body = await (await worker.fetch(new Request("https://x.test/claim"), env)).json();
-  assert.equal(body.accepts[0].amount, "3000000");
-  assert.equal(body.accepts[0].maxAmountRequired, "3000000");
-  assert.deepEqual(
-    { usdc: body.extensions.bazaar.info.price.usdc, tier: body.extensions.bazaar.info.price.tier },
-    { usdc: 3, tier: "tier-2" }
+  // A malformed proof is refused before anything is fetched, too.
+  const bad = await worker.fetch(
+    new Request("https://x.test/claim", { method: "POST", headers: { "X-PAYMENT": "not a proof" } }),
+    env
   );
-  assert.match(body.extensions.bazaar.info.price.rule, /no refunds/);
-  // Fractional tiers survive the base-unit conversion exactly.
-  plan.state = { ...plan.state, current_floor_usdc: 7.5, pricing_tier: "tier-3" };
-  assert.equal((await (await worker.fetch(new Request("https://x.test/claim"), env)).json()).accepts[0].amount, "7500000");
+  assert.equal(bad.status, 400);
+  assert.deepEqual(calls, [], "no state.json read, no RPC");
 });
 
-test("without state.json the genesis floor is assumed, never more", async () => {
+// --- the price ladder (R-10): the floor comes from the ledger's state.json, or nowhere ---
+
+test("the price is the ledger's current floor, fractional tiers exactly", async () => {
+  plan.state = { ...plan.state, current_floor_usdc: 2.5, pricing_tier: "tier-2" };
+  assert.deepEqual(w.priceFromState(await w.fetchState(env)), { units: 2_500_000n, usdc: 2.5, tier: "tier-2", source: "state.json" });
+  plan.state = { ...plan.state, current_floor_usdc: 20, pricing_tier: "tier-5" };
+  assert.equal(w.priceFromState(await w.fetchState(env)).units, 20_000_000n);
+});
+
+test("without a readable state.json the verification fails closed: no price is assumed", async () => {
   plan.stateStatus = 503;
-  const body = await (await worker.fetch(new Request("https://x.test/claim"), env)).json();
-  assert.equal(body.accepts[0].amount, "1000000");
-  assert.match(body.extensions.bazaar.info.price.source, /unavailable/);
-  // A nonsensical floor is ignored the same way.
+  const res = await w.handlePaidClaim(post(), env, "https://x.test/claim");
+  assert.equal(res.status, 503);
+  const body = await res.json();
+  assert.equal(body.verified, false);
+  assert.equal(body.retryable, true);
+  assert.match(body.next_step, /price unavailable: state.json could not be read \(HTTP 503\)/);
+  assert.equal(res.headers.get("retry-after"), "60");
+  assert.deepEqual(calls, ["https://state.test/state.json"], "no RPC fan-out without a price");
+  // A missing or nonsensical floor fails the same way.
   plan.stateStatus = null;
-  plan.state = { ...plan.state, current_floor_usdc: -2 };
-  assert.equal(w.priceFromState(await w.fetchState(env)).source, "fallback");
-  plan.state = { ...plan.state, current_floor_usdc: "3.00" };
-  assert.equal(w.priceFromState(await w.fetchState(env)).source, "fallback");
+  for (const floor of [-2, 0, "3.00", undefined, 1e9]) {
+    plan.state = { ...plan.state, current_floor_usdc: floor };
+    assert.equal(w.priceFromState(await w.fetchState(env)), null, `floor ${floor}`);
+    assert.equal((await w.handlePaidClaim(post(), env, "https://x.test/claim")).status, 503, `floor ${floor}`);
+  }
 });
 
 test("a payment below the floor is refused, final, naming both amounts", async () => {
-  plan.state = { ...plan.state, current_floor_usdc: 3.0, pricing_tier: "tier-2" };
+  plan.state = { ...plan.state, current_floor_usdc: 2.5, pricing_tier: "tier-2" };
   const res = await w.handlePaidClaim(post(), env, "https://x.test/claim");
   assert.equal(res.status, 402);
   const body = await res.json();
   assert.equal(body.verified, false);
   assert.equal(body.retryable, false);
   assert.equal(body.amount_usdc, 1);
-  assert.equal(body.floor_usdc, 3);
+  assert.equal(body.floor_usdc, 2.5);
   assert.equal(body.pricing_tier, "tier-2");
-  assert.match(body.next_step, /paid 1\.00 USDC; the current floor is 3\.00 USDC \(tier-2 tier\)/);
+  assert.match(body.next_step, /paid 1\.00 USDC; the current floor is 2\.50 USDC \(tier-2 tier\)/);
   assert.match(body.next_step, /No refunds/);
 });
 
 test("a payment at or above the floor is accepted; overpayment is noted, not refused", async () => {
-  plan.state = { ...plan.state, current_floor_usdc: 3.0, pricing_tier: "tier-2" };
-  plan.endpoints = { "*": { receipt: receipt({ amount: 3_000_000n }), head: "0x578" } };
+  plan.state = { ...plan.state, current_floor_usdc: 2.5, pricing_tier: "tier-2" };
+  plan.endpoints = { "*": { receipt: receipt({ amount: 2_500_000n }), head: "0x578" } };
   let body = await (await w.handlePaidClaim(post(), env, "https://x.test/claim")).json();
   assert.equal(body.verified, true);
-  assert.equal(body.amount_usdc, 3);
-  assert.equal(body.floor_usdc, 3);
-  plan.endpoints = { "*": { receipt: receipt({ amount: 7_500_000n }), head: "0x578" } };
+  assert.equal(body.amount_usdc, 2.5);
+  assert.equal(body.floor_usdc, 2.5);
+  plan.endpoints = { "*": { receipt: receipt({ amount: 5_000_000n }), head: "0x578" } };
   body = await (await w.handlePaidClaim(post(), env, "https://x.test/claim")).json();
   assert.equal(body.verified, true);
-  assert.equal(body.amount_usdc, 7.5);
+  assert.equal(body.amount_usdc, 5);
   assert.equal(body.pricing_tier, "tier-2");
 });
 

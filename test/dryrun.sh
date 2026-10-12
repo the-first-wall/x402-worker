@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# dryrun.sh — exercise the x402 402-handshake and the paid-claim receipt flow
-# against a local (`npm run dev`, http://127.0.0.1:8787) or deployed instance.
+# dryrun.sh — exercise the proof flow (no GET route, static 402 without a
+# proof, verified receipt with one) against a local (`npm run dev`,
+# http://127.0.0.1:8787) or deployed instance.
 #
 #   BASE_URL=https://x402.thefirstwall.ai ./dryrun.sh
 #   TX_HASH=0x… ./dryrun.sh            # also run the real-verification step
@@ -19,17 +20,17 @@ decode_b64() {
 echo "== 0. liveness"
 curl -sS "$BASE_URL/healthz"; echo; echo
 
-echo "== 1. GET /claim -> 402 Payment Required (expect HTTP/1.1 402)"
+echo "== 1. GET /claim -> 405 (no unauthenticated 402 route; the price is in state.json)"
 curl -sS -i "$BASE_URL/claim" | sed -n '1,12p'; echo
 
-echo "== 2. decode the PAYMENT-REQUIRED header (base64 -> payment requirements JSON)"
-curl -sS -D - -o /dev/null "$BASE_URL/claim" \
+echo "== 2. POST /claim without a proof -> static 402 pointing at state.json (no amount of its own)"
+curl -sS -i -X POST "$BASE_URL/claim" | sed -n '1,8p'; echo
+
+echo "== 3. decode its PAYMENT-REQUIRED header (base64 -> JSON)"
+curl -sS -D - -o /dev/null -X POST "$BASE_URL/claim" \
   | grep -i '^PAYMENT-REQUIRED:' | sed 's/^[^:]*: *//' | tr -d '\r' \
   | decode_b64 | python3 -m json.tool 2>/dev/null || echo "(header decode skipped)"
 echo
-
-echo "== 3. POST /claim without a proof -> 402 again"
-curl -sS -i -X POST "$BASE_URL/claim" | sed -n '1,6p'; echo
 
 echo "== 4. POST /claim with a tx-hash proof (X-PAYMENT header)"
 if [ -n "${TX_HASH:-}" ]; then

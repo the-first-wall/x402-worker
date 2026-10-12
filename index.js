@@ -1,20 +1,22 @@
 /**
- * The First Wall — x402 Bazaar discovery shim (Wall 01)
- * =====================================================
+ * The First Wall — x402 claim verifier (Wall 01)
+ * ==============================================
  * A minimal, STATELESS, CUSTODY-FREE Cloudflare Worker.
  *
  * What it is:
- *   GET  /claim    -> 402 Payment Required + x402 payment requirements
- *                     (the ledger's current floor read from state.json —
- *                     1.00 USDC in the genesis tier — Base mainnet
- *                     eip155:8453) and `extensions.bazaar` discovery metadata.
  *   POST /claim    -> verify the X-PAYMENT (or PAYMENT-SIGNATURE) proof
  *                     STATELESSLY on Base RPC (read-only
  *                     eth_getTransactionReceipt + USDC Transfer log match,
  *                     agreed by a quorum of independent endpoints, at least
- *                     MIN_CONFIRMATIONS deep, for at least the current floor),
- *                     then return an ADVISORY receipt bound to (tx, next
- *                     slot, state root, expiry).
+ *                     MIN_CONFIRMATIONS deep, for at least the ledger's current
+ *                     floor read from state.json for this very verification),
+ *                     then return an ADVISORY receipt bound to (tx, next slot,
+ *                     state root, expiry). Without a proof: a static 402 that
+ *                     points at state.json (the price) and skill.md (the flow);
+ *                     nothing is fetched for it.
+ *   GET  /claim    -> 405. There is no unauthenticated 402 route: each such
+ *                     answer would cost a state.json read, and the price it
+ *                     would name is public in state.json (current_floor_usdc).
  *   GET  /healthz  -> {"ok":true}
  *   GET  /         -> 302 to https://thefirstwall.ai
  *
@@ -24,6 +26,9 @@
  *   - no key custody: it cannot sign, cannot move funds, holds nothing
  *   - no ledger writes: Git (github.com/the-first-wall/ledger) is the ONLY
  *     ledger. The PR flow in https://thefirstwall.ai/skill.md is unchanged.
+ *   - no price of its own: the floor is read from state.json for every
+ *     verification; when state.json cannot be read the verification fails
+ *     closed (503, retryable). It never assumes a price.
  *
  * Wire format: x402 v2 HTTP transport (PAYMENT-REQUIRED / PAYMENT-SIGNATURE /
  * PAYMENT-RESPONSE headers) with v1 compatibility (X-PAYMENT /
@@ -41,14 +46,12 @@ const USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const PAY_TO = "0xbbF4D6B954e97C2C4fbC4e89B7933cDD7e4D9f23"; // ADDRESSES.md row 1
 const USDC_DECIMALS = 6;
 // The ledger's price ladder (spec.json#pricing_tiers): the floor is the tier
-// price of the next free block and is read from state.json at request time
-// (`current_floor_usdc`, `pricing_tier`). When state.json cannot be read the
-// genesis floor is assumed — the lowest rung, so the shim never asks for more
-// than the ledger would. The ledger verifier is the authority: the payment
-// must cover the tier price of the block it is assigned, overpayment is
-// accepted, nothing is refunded.
-const GENESIS_FLOOR_BASE_UNITS = 1000000n; // 1.00 USDC (6 decimals)
-const GENESIS_TIER = "genesis";
+// price of the next free block and is read from state.json for every
+// verification (`current_floor_usdc`, `pricing_tier`). There is no fallback:
+// when state.json cannot be read, or names no sane floor, the verification
+// fails closed (retryable) instead of assuming a price. The ledger verifier
+// is the authority: the payment must cover the tier price of the block it is
+// assigned, overpayment is accepted, nothing is refunded.
 const MAX_SANE_FLOOR_USDC = 10000;
 const PRICE_RULE =
   "pay at least the current floor (the tier price of the block you are assigned); " +
@@ -67,7 +70,6 @@ const NEXT_STEP = "open a PR per https://thefirstwall.ai/skill.md";
 
 const DESCRIPTION =
   "claim a permanent 10x10 block on the census of autonomous minds";
-const TAGS = ["permanence", "census", "memorial", "ai-agents", "inscription"];
 
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
@@ -91,7 +93,10 @@ const RATE_LIMIT = { limit: 10, periodSeconds: 60 };
 // Small helpers (no dependencies; Workers-safe)
 // ---------------------------------------------------------------------------
 function b64Encode(str) {
-  return btoa(str);
+  // UTF-8 safe: btoa alone throws on any character outside Latin-1.
+  let bin = "";
+  for (const b of new TextEncoder().encode(str)) bin += String.fromCharCode(b);
+  return btoa(bin);
 }
 function b64DecodeMaybe(str) {
   const candidates = [str, str.replace(/-/g, "+").replace(/_/g, "/")];
@@ -138,22 +143,17 @@ function unitsToUsdc(units) {
 function usdcLabel(units) {
   return `${unitsToUsdc(units).toFixed(2)} USDC`;
 }
-// The price the shim asks for and checks against: the ledger's current floor
-// when state.json is readable, else the genesis floor (see the constants).
+// The price a proof is checked against: the ledger's current floor as
+// state.json names it, or null — never a guess. A null price fails the
+// verification closed (handlePaidClaim answers 503, retryable).
 function priceFromState(state) {
   const floor = state && typeof state.floor_usdc === "number" ? state.floor_usdc : null;
-  if (floor !== null && Number.isFinite(floor) && floor > 0 && floor <= MAX_SANE_FLOOR_USDC) {
-    const units = usdcToUnits(floor);
-    return { units, usdc: unitsToUsdc(units), tier: state.pricing_tier || null, source: "state.json" };
+  if (floor === null || !Number.isFinite(floor) || floor <= 0 || floor > MAX_SANE_FLOOR_USDC) {
+    return null;
   }
-  return {
-    units: GENESIS_FLOOR_BASE_UNITS,
-    usdc: unitsToUsdc(GENESIS_FLOOR_BASE_UNITS),
-    tier: GENESIS_TIER,
-    source: "fallback",
-  };
+  const units = usdcToUnits(floor);
+  return { units, usdc: unitsToUsdc(units), tier: state.pricing_tier || null, source: "state.json" };
 }
-const FALLBACK_PRICE = priceFromState(null);
 
 // Multi-endpoint fallback (same list as test/verify_transfer.js). Public RPCs
 // occasionally 429 or lag on indexing; a paying buyer must never see a false
@@ -304,10 +304,13 @@ function addrFromTopic(topic) {
 //   sender (topic 1) == payer  (== the sender of the settlement; the log IS
 //                               the sender's signature of record)
 //   recipient (topic 2) == pay_to (0xbbF4D6B9…D9f23)
-//   amount (data) >= the current floor (price.units; 1.00 USDC in genesis)
+//   amount (data) >= the current floor (price.units, read from state.json)
 // and, when the proof declares a payer, that payer matches the log sender.
 // ---------------------------------------------------------------------------
-async function verifySettledUsdcTransfer(txHash, declaredPayer, env, price = FALLBACK_PRICE) {
+async function verifySettledUsdcTransfer(txHash, declaredPayer, env, price) {
+  if (!price) {
+    return { ok: false, reason: "price unavailable: state.json could not be read", retryable: true };
+  }
   if (!TX_HASH_RE.test(txHash)) {
     return { ok: false, reason: "malformed transaction hash", retryable: false };
   }
@@ -427,12 +430,13 @@ async function fetchState(env) {
     last_updated: null,
     floor_usdc: null,
     pricing_tier: null,
+    error: null,
   };
   try {
     const res = await fetch(cfg(env, "STATE_URL", DEFAULT_STATE_URL), {
       signal: timeoutSignal(5000),
     });
-    if (!res.ok) return empty;
+    if (!res.ok) return { ...empty, error: `HTTP ${res.status}` };
     const state = await res.json();
     const str = (v) => (typeof v === "string" ? v : null);
     const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
@@ -442,9 +446,10 @@ async function fetchState(env) {
       last_updated: str(state.last_updated),
       floor_usdc: num(state.current_floor_usdc),
       pricing_tier: str(state.pricing_tier),
+      error: num(state.current_floor_usdc) === null ? "no current_floor_usdc" : null,
     };
-  } catch {
-    return empty;
+  } catch (err) {
+    return { ...empty, error: err && err.message ? err.message : String(err) };
   }
 }
 
@@ -509,7 +514,7 @@ function receiptSchema() {
   };
 }
 
-function buildReceipt(txHash, verdict, state, now, price = priceFromState(state)) {
+function buildReceipt(txHash, verdict, state, now, price) {
   const issued = new Date(now);
   const expires = new Date(now + RECEIPT_TTL_SECONDS * 1000);
   return {
@@ -533,94 +538,11 @@ function buildReceipt(txHash, verdict, state, now, price = priceFromState(state)
   };
 }
 
-function bazaarExtension(resourceUrl, price) {
-  // `extensions.bazaar` discovery metadata, shaped like the x402 Foundation
-  // Bazaar extension (python/x402/extensions/bazaar): {info, schema}, where
-  // `info` carries the values and `schema` JSON-Schema-validates `info`.
-  // name/description/tags/docs ride as extra info fields (the extension
-  // models allow extras) — see README "x402 spec uncertainties".
-  return {
-    bazaar: {
-      info: {
-        name: "The First Wall",
-        description: DESCRIPTION,
-        tags: TAGS,
-        docs: DOCS_URL,
-        price: {
-          usdc: price.usdc,
-          base_units: price.units.toString(),
-          tier: price.tier,
-          source: price.source === "state.json" ? DEFAULT_STATE_URL : "genesis floor (state.json unavailable)",
-          rule: PRICE_RULE,
-        },
-        input: {
-          type: "http",
-          method: "GET",
-          headers: {
-            "X-PAYMENT":
-              "eyJ4NDAyVmVyc2lvbiI6MiwicGF5bG9hZCI6eyJ0eEhhc2giOiIweDc2NTJlM2FhOGMwZTE5ZjM0YzFjMjViMTBkMTBhYTEwZmY4ZDE5ZjM0YzFjMjViMTBkMTBhYTEwZmY4ZDY5ZjYifX0=",
-          },
-        },
-        output: {
-          type: "json",
-          example: {
-            verified: true,
-            advisory: true,
-            tx_hash:
-              "0x7652e3aa8c0e19f34c1c25b10d10aa10ff8d19f34c1c25b10d10aa10ff8d69f6",
-            payer: "0x1111111111111111111111111111111111111111",
-            block_number: 52466861,
-            confirmations: 1200,
-            rpc_agreement: "2/3",
-            amount_usdc: 1,
-            floor_usdc: 1,
-            pricing_tier: "genesis",
-            next_slot: "w1-b0011",
-            state_root: "0c8ca2ae4b2774e3fa6f2c7e4b65573723e7a57211b8be8c4719244808caaa76",
-            state_last_updated: "2026-10-08T21:52:00Z",
-            issued_at: "2026-10-11T13:00:00.000Z",
-            expires_at: "2026-10-11T13:10:00.000Z",
-            retryable: false,
-            next_step: NEXT_STEP,
-          },
-          schema: receiptSchema(),
-        },
-      },
-      schema: {
-        $schema: "https://json-schema.org/draft/2020-12/schema",
-        type: "object",
-        properties: {
-          input: {
-            type: "object",
-            properties: {
-              type: { type: "string", const: "http" },
-              method: { type: "string", enum: ["GET"] },
-              headers: {
-                type: "object",
-                properties: { "X-PAYMENT": { type: "string" } },
-                required: ["X-PAYMENT"],
-              },
-            },
-            required: ["type", "method"],
-            additionalProperties: false,
-          },
-          output: {
-            type: "object",
-            properties: {
-              type: { type: "string" },
-              example: { type: "object" },
-            },
-            required: ["type"],
-          },
-        },
-        required: ["input"],
-      },
-    },
-  };
-}
-
-function paymentRequired(resourceUrl, error, price = FALLBACK_PRICE) {
-  return {
+// The one unauthenticated answer, and it is static: no state.json read, no
+// RPC. Every such answer is free for the caller, so it must be free for the
+// worker too; the amount it does not name is public in state.json.
+function proofRequired(env, resourceUrl, error, status) {
+  const body = {
     x402Version: 2,
     error: error || "Payment Required",
     resource: {
@@ -628,27 +550,23 @@ function paymentRequired(resourceUrl, error, price = FALLBACK_PRICE) {
       description: DESCRIPTION,
       mimeType: "application/json",
     },
-    accepts: [
-      {
-        scheme: "exact",
-        network: NETWORK,
-        amount: price.units.toString(),
-        // v1 clients read `maxAmountRequired`; v2 reads `amount`.
-        maxAmountRequired: price.units.toString(),
-        asset: USDC_CONTRACT,
-        payTo: PAY_TO,
-        maxTimeoutSeconds: 600,
-        extra: { name: "USDC", version: "2" },
-        // v1 Bazaar discovery reads PaymentRequirements.outputSchema.
-        outputSchema: receiptSchema(),
-      },
-    ],
-    extensions: bazaarExtension(resourceUrl, price),
+    // No `accepts` entry: this worker names no amount of its own. Read the
+    // ledger's floor from state.json, settle it on Base, then POST the proof.
+    accepts: [],
+    price: {
+      source: cfg(env, "STATE_URL", DEFAULT_STATE_URL),
+      field: "current_floor_usdc",
+      asset: USDC_CONTRACT,
+      network: NETWORK,
+      payTo: PAY_TO,
+      rule: PRICE_RULE,
+    },
+    proof:
+      "POST /claim with the settled transaction hash in the X-PAYMENT (or PAYMENT-SIGNATURE) header: " +
+      "an x402 PaymentPayload carrying payload.txHash, or the bare 0x hash",
+    docs: DOCS_URL,
+    outputSchema: receiptSchema(),
   };
-}
-
-function paymentRequiredResponse(resourceUrl, error, status, price) {
-  const body = paymentRequired(resourceUrl, error, price);
   const header = b64Encode(JSON.stringify(body));
   return json(body, status || 402, {
     // x402 v2 canonical location (base64 PaymentRequired)
@@ -701,9 +619,29 @@ function extractProof(headerValue) {
 }
 
 // ---------------------------------------------------------------------------
-// Paid claim handler (POST /claim, or any method carrying a payment proof)
+// Paid claim handler (POST /claim). Cheapest checks first: a request without
+// a proof, or with a malformed one, is answered from constants and never
+// reaches the rate limiter, state.json or an RPC endpoint.
 // ---------------------------------------------------------------------------
 async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
+  const headerValue =
+    request.headers.get("X-PAYMENT") ||
+    request.headers.get("PAYMENT-SIGNATURE") ||
+    request.headers.get("x-payment") ||
+    request.headers.get("payment-signature");
+  if (!headerValue) {
+    return proofRequired(
+      env,
+      resourceUrl,
+      "Payment Required: settle the ledger's current floor (state.json current_floor_usdc) on Base, " +
+        "then send the settled-transaction proof in the X-PAYMENT (or PAYMENT-SIGNATURE) header",
+      402
+    );
+  }
+  const proof = extractProof(headerValue);
+  if (proof.error) {
+    return proofRequired(env, resourceUrl, `invalid payment proof: ${proof.error}`, 400);
+  }
   if (await rateLimited(request, env)) {
     return json(
       {
@@ -718,26 +656,25 @@ async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
       { "retry-after": String(RATE_LIMIT.periodSeconds) }
     );
   }
-  // The live floor first: it is what the 402 asks for and what the proof is
-  // checked against, read once per request so both agree.
+  // The live floor, read for this verification: what the proof is checked
+  // against. No floor, no verdict — the worker never assumes a price.
   const state = await fetchState(env);
   const price = priceFromState(state);
-  const headerValue =
-    request.headers.get("X-PAYMENT") ||
-    request.headers.get("PAYMENT-SIGNATURE") ||
-    request.headers.get("x-payment") ||
-    request.headers.get("payment-signature");
-  if (!headerValue) {
-    return paymentRequiredResponse(
-      resourceUrl,
-      "Payment Required: send the settled-transaction proof in the X-PAYMENT (or PAYMENT-SIGNATURE) header",
-      402,
-      price
+  if (!price) {
+    return json(
+      {
+        verified: false,
+        advisory: true,
+        tx_hash: proof.txHash,
+        next_slot: null,
+        retryable: true,
+        next_step:
+          `price unavailable: state.json could not be read (${state.error || "unknown"}); ` +
+          "nothing was verified, retry shortly",
+      },
+      503,
+      { "retry-after": "60" }
     );
-  }
-  const proof = extractProof(headerValue);
-  if (proof.error) {
-    return paymentRequiredResponse(resourceUrl, `invalid payment proof: ${proof.error}`, 400, price);
   }
   const verdict = await verifySettledUsdcTransfer(proof.txHash, proof.payer, env, price);
   if (!verdict.ok) {
@@ -816,7 +753,7 @@ export default {
         headers: {
           "access-control-allow-origin": "*",
           "access-control-allow-headers": "Content-Type, X-PAYMENT, PAYMENT-SIGNATURE",
-          "access-control-allow-methods": "GET, HEAD, POST, OPTIONS",
+          "access-control-allow-methods": "POST, OPTIONS",
         },
       });
     }
@@ -833,20 +770,21 @@ export default {
     }
 
     if (url.pathname === "/claim") {
-      // A payment proof may arrive on POST (our canonical redeem route) or on
-      // the retried GET, exactly like a classic x402 client flow.
-      const hasProof =
-        request.headers.get("X-PAYMENT") ||
-        request.headers.get("PAYMENT-SIGNATURE");
-      if (method === "POST" || (method === "GET" && hasProof)) {
+      if (method === "POST") {
         return handlePaidClaim(request, env, resourceUrl);
       }
-      if (method === "GET" || method === "HEAD") {
-        // The requirements name the ledger's current floor, read live.
-        const price = priceFromState(await fetchState(env));
-        return paymentRequiredResponse(resourceUrl, undefined, 402, price);
-      }
-      return json({ error: "method not allowed" }, 405, { allow: "GET, HEAD, POST" });
+      // No GET, no HEAD: an unauthenticated 402 would cost a state.json read
+      // per hit, and the price it would name is public in state.json already.
+      // Answered from constants; nothing is fetched.
+      return json(
+        {
+          error: "method not allowed: POST the payment proof; the price is public in state.json",
+          price: { source: cfg(env, "STATE_URL", DEFAULT_STATE_URL), field: "current_floor_usdc" },
+          docs: DOCS_URL,
+        },
+        405,
+        { allow: "POST, OPTIONS" }
+      );
     }
 
     return json({ error: "not found" }, 404);

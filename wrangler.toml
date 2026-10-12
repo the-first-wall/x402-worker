@@ -1,4 +1,4 @@
-# The First Wall — x402 discovery shim
+# The First Wall — x402 claim verifier
 # =====================================
 # Deliberately contains NO account-specific identifiers (no account_id, no
 # zone_id, no routes bound to a zone). The operator's Cloudflare account
@@ -18,12 +18,15 @@ compatibility_date = "2026-10-01"
 # endpoints (publicnode, 1rpc) are hardcoded in index.js rpcUrls().
 RPC_URL = "https://mainnet.base.org"
 # Live ledger-derived state (static site) — the worker reads `next_available_slot`,
-# `current_floor_usdc` and `pricing_tier` from here at request time (the price it
-# asks for and checks against) and never stores them.
+# `current_floor_usdc` and `pricing_tier` from here for every verification (the
+# price it checks against) and never stores them. There is no fallback price:
+# when this cannot be read, a verification fails closed (503, retryable).
+# Only a POST carrying a well-formed proof reads it; GET /claim and a POST
+# without a proof are answered from constants.
 STATE_URL = "https://thefirstwall.ai/state.json"
 SITE_URL = "https://thefirstwall.ai"
-# The public URL this shim is served from. MUST match the deployed URL so the
-# x402 `resource.url` and Bazaar metadata are accurate.
+# The public URL this worker is served from. MUST match the deployed URL so the
+# x402 `resource.url` is accurate.
 # INTERIM 2026-10-09: thefirstwall.ai is delegated at GoDaddy (ns03/04.domaincontrol.com)
 # and NOT on this Cloudflare account, so the x402.thefirstwall.ai custom domain
 # cannot be pinned yet. Point at the live workers.dev URL until the zone moves,
@@ -39,7 +42,7 @@ RPC_QUORUM = "2"
 # Uncomment and adjust once the zone is on the deploying account:
 # routes = [{ pattern = "x402.thefirstwall.ai/*", custom_domain = true }]
 
-# Optional: Cloudflare rate-limiting binding for POST /claim (per colo). Without
+# Optional: Cloudflare rate-limiting binding for proof verification (per colo). Without
 # it the worker falls back to a per-isolate token bucket (10 per minute per
 # client IP). Check the current syntax in the Cloudflare docs before enabling:
 # https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
