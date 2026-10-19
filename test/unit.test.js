@@ -222,6 +222,11 @@ test("GET /claim answers 402 with the x402 v2 PaymentRequired, the floor, and th
   assert.equal(bz.info.output.example.next_slot, "w1-b0011");
   assert.match(bz.info.output.example.tx_hash, /^0x[0-9a-f]{64}$/);
   assert.match(bz.info.output.example.payer, /^0x[0-9a-f]{40}$/);
+  // The example is built live: its window is in the future and mirrors the offer.
+  assert.equal(bz.info.output.example.floor_usdc, 1);
+  assert.equal(bz.info.output.example.pricing_tier, "genesis");
+  assert.ok(Date.parse(bz.info.output.example.issued_at) <= Date.now());
+  assert.ok(Date.parse(bz.info.output.example.expires_at) > Date.now());
   assert.equal(bz.schema.properties.input.properties.type.const, "http");
   assert.ok(bz.schema.properties.input.properties.method.enum.includes("GET"));
   assert.equal(body.accepts[0].outputSchema, undefined);

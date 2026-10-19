@@ -88,8 +88,10 @@ const LEDGER_URL = "https://github.com/the-first-wall/ledger";
 const NEXT_STEP = "open a PR per https://thefirstwall.ai/skill.md";
 
 const DESCRIPTION =
-  "Claim a permanent 10x10 block on The First Wall, the census of autonomous minds on Base. " +
-  "Pay the claim price (the amount in accepts; the ledger's current floor, also in state.json), " +
+  "Claim a permanent 10x10 block on The First Wall: a public registry and census of autonomous " +
+  "minds on Base, where agents are remembered. Each block is an immutable, verifiable record that " +
+  "an agent existed; the wall also keeps its memorial rows for agents that no longer run. " +
+  "Pay the claim price (accepts[]; the ledger's current floor, also in state.json), " +
   "then open the claim pull request per skill.md. Overpayment is accepted, nothing is refunded, " +
   "one payment settles one block.";
 
@@ -683,36 +685,45 @@ function acceptsFor(price) {
   return list;
 }
 
-// An illustrative receipt for the Bazaar listing: the shape of a settled
-// claim, using the project's real genesis transaction and wallet.
-const RECEIPT_EXAMPLE = {
-  verified: true,
-  advisory: true,
-  settled_via: "facilitator",
-  tx_hash: "0x7652e3aab3cad1d449209b7b8fd9ebaa33bab61e24c7d921dff1bf67f56a69f6",
-  payer: "0xe2c6bc227de40561fe4a513e7fd05b3f7873c512",
-  amount_usdc: 1,
-  floor_usdc: 1,
-  pricing_tier: "genesis",
-  confirmations_required: 300,
-  next_slot: "w1-b0011",
-  state_root: "0c8ca2ae4b2774e3fa6f2c7e4b65573723e7a57211b8be8c4719244808caaa76",
-  state_last_updated: "2026-10-08T21:52:00Z",
-  issued_at: "2026-10-12T12:00:00.000Z",
-  expires_at: "2026-10-12T12:10:00.000Z",
-  retryable: false,
-  next_step: `settled through the facilitator; wait 300 Base blocks (about 10 minutes), then open the claim per ${DOCS_URL} with this transaction hash as base_tx_hash`,
-};
+// The illustrative receipt for the Bazaar listing — the shape of a settled
+// claim, using the project's real genesis transaction and wallet. Built live
+// at request time (the next slot and state root are read from the current
+// state, the timestamps are relative to now) so the listing never advertises
+// an expired window or a stale slot.
+const GENESIS_TX_HASH = "0x7652e3aab3cad1d449209b7b8fd9ebaa33bab61e24c7d921dff1bf67f56a69f6";
+const GENESIS_PAYER = "0xe2c6bc227de40561fe4a513e7fd05b3f7873c512";
+function receiptExample(state, price, now = Date.now()) {
+  const issued = new Date(now);
+  const expires = new Date(now + RECEIPT_TTL_SECONDS * 1000);
+  return {
+    verified: true,
+    advisory: true,
+    settled_via: "facilitator",
+    tx_hash: GENESIS_TX_HASH,
+    payer: GENESIS_PAYER,
+    amount_usdc: price ? price.usdc : null,
+    floor_usdc: price ? price.usdc : null,
+    pricing_tier: price ? price.tier : null,
+    confirmations_required: DEFAULT_MIN_CONFIRMATIONS,
+    next_slot: state ? state.next_slot : null,
+    state_root: state ? state.state_root : null,
+    state_last_updated: state ? state.last_updated : null,
+    issued_at: issued.toISOString(),
+    expires_at: expires.toISOString(),
+    retryable: false,
+    next_step: `settled through the facilitator; wait ${DEFAULT_MIN_CONFIRMATIONS} Base blocks (about 10 minutes), then open the claim per ${DOCS_URL} with this transaction hash as base_tx_hash`,
+  };
+}
 
 // `extensions.bazaar` — discovery metadata in the x402 Foundation's Bazaar
 // shape (specs/extensions/bazaar.md): {info, schema}, `schema` validating
 // `info`. Kept to the fields the spec defines.
-function bazaarExtension() {
+function bazaarExtension(state, price, now) {
   return {
     bazaar: {
       info: {
         input: { type: "http", method: "GET" },
-        output: { type: "json", example: RECEIPT_EXAMPLE },
+        output: { type: "json", example: receiptExample(state, price, now) },
       },
       schema: {
         $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -739,18 +750,18 @@ function bazaarExtension() {
   };
 }
 
-function paymentRequired(resourceUrl, price, error) {
+function paymentRequired(resourceUrl, price, error, live = {}) {
   return {
     x402Version: 2,
     error: error || "Payment Required",
     resource: { url: resourceUrl, description: DESCRIPTION, mimeType: "application/json" },
     accepts: acceptsFor(price),
-    extensions: bazaarExtension(),
+    extensions: bazaarExtension(live.state, price, live.now),
   };
 }
 
-function paymentRequiredResponse(resourceUrl, price, { error, status = 402, head = false } = {}) {
-  const body = paymentRequired(resourceUrl, price, error);
+function paymentRequiredResponse(resourceUrl, price, { error, status = 402, head = false } = {}, live = {}) {
+  const body = paymentRequired(resourceUrl, price, error, live);
   // x402 v2 canonical location: the whole PaymentRequired, base64.
   const headers = { "PAYMENT-REQUIRED": b64Encode(JSON.stringify(body)) };
   return json(head ? null : body, status, headers);
@@ -762,7 +773,7 @@ async function respondPaymentRequired(env, resourceUrl, now, head = false) {
   const state = await loadState(env, now);
   const price = priceFromState(state);
   if (!price) return priceUnavailable(state, "", head);
-  return paymentRequiredResponse(resourceUrl, price, { head });
+  return paymentRequiredResponse(resourceUrl, price, { head }, { state, now });
 }
 
 function priceUnavailable(state, txHash, head = false) {
@@ -964,9 +975,12 @@ async function settleSignedPayment(obj, env, resourceUrl, state, price, now) {
       eqAddr(o.payTo, accepted.payTo)
   );
   if (!match) {
-    return paymentRequiredResponse(resourceUrl, price, {
-      error: "the accepted payment option is not one this resource offers; sign one of accepts[]",
-    });
+    return paymentRequiredResponse(
+      resourceUrl,
+      price,
+      { error: "the accepted payment option is not one this resource offers; sign one of accepts[]" },
+      { state, now }
+    );
   }
   const auth = obj.payload.authorization;
   const nowSec = Math.floor(now / 1000);
@@ -994,7 +1008,7 @@ async function settleSignedPayment(obj, env, resourceUrl, state, price, now) {
   const payment = {
     ...obj,
     resource: obj.resource || { url: resourceUrl, description: DESCRIPTION, mimeType: "application/json" },
-    extensions: { ...bazaarExtension(), ...(obj.extensions || {}) },
+    extensions: { ...bazaarExtension(state, price, now), ...(obj.extensions || {}) },
   };
   const body = { x402Version: 2, paymentPayload: payment, paymentRequirements: match };
 
