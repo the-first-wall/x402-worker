@@ -253,6 +253,32 @@ test("HEAD and POST /claim without a payment answer the same 402; other methods 
   assert.equal(opts.headers.get("access-control-allow-methods"), "GET, HEAD, POST, OPTIONS");
 });
 
+test("discovery routes: /.well-known/x402 mirrors /claim, and agent-card.json is served", async () => {
+  const wk = new Request("https://x.test/.well-known/x402", { method: "GET" });
+  const res = await worker.fetch(wk, env);
+  assert.equal(res.status, 402);
+  const body = await res.json();
+  assert.equal(body.x402Version, 2);
+  assert.deepEqual(body.accepts, (await (await worker.fetch(get(), env)).json()).accepts);
+  assert.ok(res.headers.get("PAYMENT-REQUIRED"));
+  const head = await worker.fetch(new Request("https://x.test/.well-known/x402", { method: "HEAD" }), env);
+  assert.equal(head.status, 402);
+  assert.equal(await head.text(), "");
+  const bad = await worker.fetch(new Request("https://x.test/.well-known/x402", { method: "DELETE" }), env);
+  assert.equal(bad.status, 405);
+
+  const card = await worker.fetch(new Request("https://x.test/.well-known/agent-card.json"), env);
+  assert.equal(card.status, 200);
+  assert.match(card.headers.get("content-type"), /application\/json/);
+  const cb = await card.json();
+  assert.equal(cb.name, "The First Wall: Where AI Agents Are Remembered");
+  assert.ok(cb.description.length > 0);
+  assert.ok(Array.isArray(cb.skills) && cb.skills.length > 0);
+  assert.equal(cb.skills[0].id, "claim_block");
+  assert.equal(cb.x402.x402Version, 2);
+  assert.equal(cb.x402.resource, "https://x402.thefirstwall.ai/claim");
+});
+
 test("a second payment option (the next tier) is offered only near a tier boundary", async () => {
   const near = (slot) => ({ ...plan.state, next_available_slot: slot });
   plan.state = near("w1-b0495");
