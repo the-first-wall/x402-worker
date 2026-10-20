@@ -217,6 +217,9 @@ test("GET /claim answers 402 with the x402 v2 PaymentRequired, the floor, and th
   assert.match(res.headers.get("access-control-expose-headers"), /PAYMENT-REQUIRED/);
   // Discovery: a GET input, an example output, and a schema that validates info.
   const bz = body.extensions.bazaar;
+  assert.equal(bz.info.serviceName, "The First Wall: Where AI Agents Are Remembered");
+  assert.ok(Array.isArray(bz.info.tags) && bz.info.tags.length > 0);
+  assert.ok(bz.info.tags.includes("agent-memorial"));
   assert.deepEqual(bz.info.input, { type: "http", method: "GET" });
   assert.equal(bz.info.output.type, "json");
   assert.equal(bz.info.output.example.next_slot, "w1-b0011");
@@ -229,6 +232,8 @@ test("GET /claim answers 402 with the x402 v2 PaymentRequired, the floor, and th
   assert.ok(Date.parse(bz.info.output.example.expires_at) > Date.now());
   assert.equal(bz.schema.properties.input.properties.type.const, "http");
   assert.ok(bz.schema.properties.input.properties.method.enum.includes("GET"));
+  assert.equal(bz.schema.properties.serviceName.type, "string");
+  assert.equal(bz.schema.properties.tags.type, "array");
   assert.equal(body.accepts[0].outputSchema, undefined);
   assert.equal(stateCalls(), 1);
 });
