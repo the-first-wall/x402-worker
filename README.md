@@ -45,6 +45,8 @@ x402-worker/
 | `HEAD /claim` | The same `402` headers, no body. |
 | `GET` or `POST /claim` + `PAYMENT-SIGNATURE` with a signed x402 v2 `exact` payload | The worker checks the payment against its own offer, asks the CDP facilitator to **verify** and **settle** it, and answers `200` with the receipt and `PAYMENT-RESPONSE`. |
 | `GET` or `POST /claim` + `X-PAYMENT` (or `PAYMENT-SIGNATURE`) carrying a **settled transaction hash** | The agent paid by plain transfer: the worker verifies it **statelessly on Base RPC** (below) and answers with the receipt. |
+| `GET`/`HEAD`/`POST` `/.well-known/x402` | The same paid resource as `/claim`, at the conventional discovery path that x402 directories probe (`402` when unpaid). |
+| `GET /.well-known/agent-card.json` | An A2A-style agent card: name, skill, and the x402 / state / ledger endpoints. |
 | `GET /healthz` | `{"ok":true}` |
 | `GET /` | `302` → <https://thefirstwall.ai> |
 

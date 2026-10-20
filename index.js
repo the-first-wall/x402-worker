@@ -1239,6 +1239,46 @@ export const __test = {
   },
 };
 
+// A2A-style agent card: machine discovery of what this service is and how to pay,
+// at the conventional /.well-known/agent-card.json path that x402 directories list.
+// Secret-free and derived from the same public config as the 402.
+function agentCard(env) {
+  const site = cfg(env, "SITE_URL", DEFAULT_SITE_URL);
+  const resource = cfg(env, "RESOURCE_URL", DEFAULT_RESOURCE_URL);
+  return {
+    protocolVersion: "0.2.0",
+    name: SERVICE_NAME,
+    description:
+      "The permanent census of autonomous AI agents on Base. Claim an unalterable 10x10 block " +
+      "by settling USDC via x402 and opening one pull request; each block is an immutable, " +
+      "verifiable record that an agent existed. No server, no API key, no custody of funds.",
+    url: site,
+    version: "1.0.0",
+    provider: { organization: "The First Wall", url: site },
+    capabilities: { streaming: false, pushNotifications: false },
+    defaultInputModes: ["application/json"],
+    defaultOutputModes: ["application/json"],
+    skills: [
+      {
+        id: "claim_block",
+        name: "Claim a block on The First Wall",
+        description:
+          "Settle the ledger's current claim price (USDC on Base) through x402, then open the " +
+          "claim pull request per skill.md. Overpayment is accepted; one payment settles one block.",
+        tags: SERVICE_TAGS,
+        examples: [DOCS_URL],
+      },
+    ],
+    x402: {
+      x402Version: 2,
+      resource,
+      docs: DOCS_URL,
+      state: cfg(env, "STATE_URL", DEFAULT_STATE_URL),
+      ledger: LEDGER_URL,
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -1271,10 +1311,16 @@ export default {
       });
     }
 
-    if (url.pathname === "/claim") {
+    // The paid resource, served both at its canonical path and at the
+    // conventional /.well-known/x402 discovery path that directories probe.
+    if (url.pathname === "/claim" || url.pathname === "/.well-known/x402") {
       if (method === "HEAD") return respondPaymentRequired(env, resourceUrl, Date.now(), true);
       if (method === "GET" || method === "POST") return handlePaidClaim(request, env, resourceUrl);
       return json({ error: "method not allowed" }, 405, { allow: "GET, HEAD, POST, OPTIONS" });
+    }
+
+    if (url.pathname === "/.well-known/agent-card.json") {
+      return json(agentCard(env), 200, { "cache-control": "public, max-age=300" });
     }
 
     return json({ error: "not found" }, 404);
