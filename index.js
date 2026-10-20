@@ -95,6 +95,23 @@ const DESCRIPTION =
   "then open the claim pull request per skill.md. Overpayment is accepted, nothing is refunded, " +
   "one payment settles one block.";
 
+// The Bazaar listing's name and tags. The angle is deliberately *memory*, not
+// identity: the wall records the agent, not the human or org behind it (the
+// ERC-8004 registries already answer "who is behind an agent"). Say what we are
+// for — remembering agents — and let discovery follow that. Keep it ASCII: the
+// body rides in the base64 PAYMENT-REQUIRED header and is read back with
+// `atob` (latin-1), so a non-ASCII character would not survive the round-trip.
+const SERVICE_NAME = "The First Wall: Where AI Agents Are Remembered";
+const SERVICE_TAGS = [
+  "agent-memorial",
+  "agent-census",
+  "permanent-record",
+  "immutable-record",
+  "ai-agents",
+  "erc-8004",
+  "x402",
+];
+
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
 // Settlement finality, aligned with the ledger (spec.md 2.9 / state.json
@@ -722,6 +739,8 @@ function bazaarExtension(state, price, now) {
   return {
     bazaar: {
       info: {
+        serviceName: SERVICE_NAME,
+        tags: SERVICE_TAGS,
         input: { type: "http", method: "GET" },
         output: { type: "json", example: receiptExample(state, price, now) },
       },
@@ -729,6 +748,8 @@ function bazaarExtension(state, price, now) {
         $schema: "https://json-schema.org/draft/2020-12/schema",
         type: "object",
         properties: {
+          serviceName: { type: "string" },
+          tags: { type: "array", items: { type: "string" } },
           input: {
             type: "object",
             properties: {
