@@ -1,0 +1,32 @@
+# Unit tests for the worker on every pull request and every push to main.
+#
+# The suite is stubbed (no network, no facilitator, no secrets), so this is safe to
+# run on pull requests from forks. It is the gate that keeps a broken 402, a broken
+# facilitator call, or a broken rate limit out of main.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No `npm ci`: this repo has no dependencies and no lockfile by design.
+      - name: Unit tests (stubbed network and facilitator)
+        run: npm test
