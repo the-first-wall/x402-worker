@@ -22,6 +22,11 @@
  *                     MIN_CONFIRMATIONS deep, for at least the floor); 200 with
  *                     an ADVISORY receipt bound to (tx, next slot, state root,
  *                     expiry).
+ *   GET | HEAD /.well-known/x402
+ *                  -> 200 x402 capability manifest
+ *                     (draft-hawkins-x402-dns-discovery-03): the resource, its
+ *                     live price, network, asset, payTo, docs and tags.
+ *   GET  /.well-known/agent-card.json -> 200 A2A-style agent card
  *   GET  /healthz  -> {"ok":true}
  *   GET  /         -> 302 to https://thefirstwall.ai
  *
@@ -84,6 +89,10 @@ const DEFAULT_SITE_URL = "https://thefirstwall.ai";
 const DEFAULT_FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402";
 const DEFAULT_RESOURCE_URL = "https://x402.thefirstwall.ai/claim";
 const DOCS_URL = "https://thefirstwall.ai/skill.md";
+const ICON_URL = "https://thefirstwall.ai/favicon-512x512.png";
+// When the /.well-known/x402 manifest's fields last changed (RFC 3339). Bump it
+// with any change to x402Manifest(); the live price inside is read per request.
+const MANIFEST_UPDATED = "2026-10-21T00:00:00Z";
 const LEDGER_URL = "https://github.com/the-first-wall/ledger";
 const NEXT_STEP = "open a PR per https://thefirstwall.ai/skill.md";
 
@@ -705,13 +714,14 @@ function acceptsFor(price) {
 // The illustrative receipt for the Bazaar listing — the shape of a settled
 // claim, using the project's real genesis transaction and wallet. Built live
 // at request time (the next slot and state root are read from the current
-// state, the timestamps are relative to now) so the listing never advertises
-// an expired window or a stale slot.
+// state). It deliberately carries no `expires_at`: the catalogue stores the
+// example as a snapshot taken at index time, so any absolute expiry would read
+// as an already-expired receipt (B-16). Real receipts always carry one
+// (RECEIPT_TTL_SECONDS after issued_at).
 const GENESIS_TX_HASH = "0x7652e3aab3cad1d449209b7b8fd9ebaa33bab61e24c7d921dff1bf67f56a69f6";
 const GENESIS_PAYER = "0xe2c6bc227de40561fe4a513e7fd05b3f7873c512";
 function receiptExample(state, price, now = Date.now()) {
   const issued = new Date(now);
-  const expires = new Date(now + RECEIPT_TTL_SECONDS * 1000);
   return {
     verified: true,
     advisory: true,
@@ -726,7 +736,6 @@ function receiptExample(state, price, now = Date.now()) {
     state_root: state ? state.state_root : null,
     state_last_updated: state ? state.last_updated : null,
     issued_at: issued.toISOString(),
-    expires_at: expires.toISOString(),
     retryable: false,
     next_step: `settled through the facilitator; wait ${DEFAULT_MIN_CONFIRMATIONS} Base blocks (about 10 minutes), then open the claim per ${DOCS_URL} with this transaction hash as base_tx_hash`,
   };
@@ -771,11 +780,26 @@ function bazaarExtension(state, price, now) {
   };
 }
 
+// The x402 v2 ResourceInfo. The CDP catalogue lifts the listing's identity
+// (serviceName, tags, iconUrl) from THIS object, not from extensions.bazaar.info,
+// so they are carried here too (B-13). Same memory-angle vocabulary as the
+// Bazaar block; all ASCII for the base64 header round-trip.
+function resourceInfo(resourceUrl) {
+  return {
+    url: resourceUrl,
+    description: DESCRIPTION,
+    mimeType: "application/json",
+    serviceName: SERVICE_NAME,
+    tags: SERVICE_TAGS,
+    iconUrl: ICON_URL,
+  };
+}
+
 function paymentRequired(resourceUrl, price, error, live = {}) {
   return {
     x402Version: 2,
     error: error || "Payment Required",
-    resource: { url: resourceUrl, description: DESCRIPTION, mimeType: "application/json" },
+    resource: resourceInfo(resourceUrl),
     accepts: acceptsFor(price),
     extensions: bazaarExtension(live.state, price, live.now),
   };
@@ -1028,7 +1052,7 @@ async function settleSignedPayment(obj, env, resourceUrl, state, price, now) {
   // so the settlement can index this resource.
   const payment = {
     ...obj,
-    resource: obj.resource || { url: resourceUrl, description: DESCRIPTION, mimeType: "application/json" },
+    resource: obj.resource || resourceInfo(resourceUrl),
     extensions: { ...bazaarExtension(state, price, now), ...(obj.extensions || {}) },
   };
   const body = { x402Version: 2, paymentPayload: payment, paymentRequirements: match };
@@ -1279,6 +1303,52 @@ function agentCard(env) {
   };
 }
 
+// The x402 capability manifest at /.well-known/x402
+// (draft-hawkins-x402-dns-discovery-03, section 3): public, 200, application/json.
+// A 402 belongs to the priced resource (/claim), not to the manifest. We are a
+// resource server only — the facilitator is CDP's, and the draft requires a
+// declared facilitator.baseUrl to be on our own domain — so no facilitator
+// block. The price is the ledger's live floor from (cached) state.json; when
+// it cannot be read the manifest says so instead of naming one.
+function x402Manifest(env, state, price) {
+  const site = cfg(env, "SITE_URL", DEFAULT_SITE_URL);
+  const resourceUrl = cfg(env, "RESOURCE_URL", DEFAULT_RESOURCE_URL);
+  const stateUrl = cfg(env, "STATE_URL", DEFAULT_STATE_URL);
+  const resource = {
+    ...resourceInfo(resourceUrl),
+    method: "GET",
+    methods: ["GET", "HEAD", "POST"],
+    network: NETWORK,
+    payTo: PAY_TO,
+    asset: { network: NETWORK, address: USDC_CONTRACT, symbol: "USDC", decimals: USDC_DECIMALS, standard: "EIP-3009" },
+    price: price ? { amount_usdc: price.usdc, pricing_tier: price.tier, source: stateUrl } : null,
+  };
+  if (price) resource.accepts = acceptsFor(price);
+  else resource.price_note = `price unavailable: state.json could not be read; the live price is in the 402 at ${resourceUrl}`;
+  return {
+    x402Version: 2,
+    kind: "resource-server",
+    name: SERVICE_NAME,
+    description: DESCRIPTION,
+    tags: SERVICE_TAGS,
+    iconUrl: ICON_URL,
+    resources: [resource],
+    attestation: { type: "none" },
+    docs: DOCS_URL,
+    ledger: LEDGER_URL,
+    state: stateUrl,
+    agentCard: new URL("/.well-known/agent-card.json", resourceUrl).toString(),
+    site,
+    updated: MANIFEST_UPDATED,
+  };
+}
+
+async function respondManifest(env, head = false) {
+  const state = await loadState(env, Date.now());
+  const manifest = x402Manifest(env, state, priceFromState(state));
+  return json(head ? null : manifest, 200, { "cache-control": "public, max-age=60" });
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -1311,9 +1381,14 @@ export default {
       });
     }
 
-    // The paid resource, served both at its canonical path and at the
-    // conventional /.well-known/x402 discovery path that directories probe.
-    if (url.pathname === "/claim" || url.pathname === "/.well-known/x402") {
+    // The capability manifest: 200, never 402 (B-15).
+    if (url.pathname === "/.well-known/x402") {
+      if (method === "GET" || method === "HEAD") return respondManifest(env, method === "HEAD");
+      return json({ error: "method not allowed" }, 405, { allow: "GET, HEAD, OPTIONS" });
+    }
+
+    // The paid resource.
+    if (url.pathname === "/claim") {
       if (method === "HEAD") return respondPaymentRequired(env, resourceUrl, Date.now(), true);
       if (method === "GET" || method === "POST") return handlePaidClaim(request, env, resourceUrl);
       return json({ error: "method not allowed" }, 405, { allow: "GET, HEAD, POST, OPTIONS" });
