@@ -202,6 +202,14 @@ test("GET /claim answers 402 with the x402 v2 PaymentRequired, the floor, and th
   assert.equal(body.x402Version, 2);
   assert.equal(body.resource.mimeType, "application/json");
   assert.ok(body.resource.description.length <= 500);
+  // B-13: the catalogue lifts service identity from resource{}, so it is there,
+  // in the same memory-angle vocabulary as the Bazaar block.
+  assert.equal(body.resource.serviceName, "The First Wall: Where AI Agents Are Remembered");
+  assert.deepEqual(body.resource.tags, body.extensions.bazaar.info.tags);
+  assert.ok(body.resource.tags.includes("agent-memorial"));
+  assert.ok(!body.resource.tags.some((t) => /registry|identity/.test(t)), "memory, not identity/registry");
+  assert.equal(body.resource.iconUrl, "https://thefirstwall.ai/favicon-512x512.png");
+  assert.equal(body.resource.url, "https://x402.thefirstwall.ai/claim");
   assert.equal(body.accepts.length, 1);
   assert.deepEqual(body.accepts[0], {
     scheme: "exact",
@@ -225,11 +233,13 @@ test("GET /claim answers 402 with the x402 v2 PaymentRequired, the floor, and th
   assert.equal(bz.info.output.example.next_slot, "w1-b0011");
   assert.match(bz.info.output.example.tx_hash, /^0x[0-9a-f]{64}$/);
   assert.match(bz.info.output.example.payer, /^0x[0-9a-f]{40}$/);
-  // The example is built live: its window is in the future and mirrors the offer.
+  // The example is built live and mirrors the offer. B-16: it carries no
+  // absolute expiry, which an index snapshot would turn into a stale one.
   assert.equal(bz.info.output.example.floor_usdc, 1);
   assert.equal(bz.info.output.example.pricing_tier, "genesis");
   assert.ok(Date.parse(bz.info.output.example.issued_at) <= Date.now());
-  assert.ok(Date.parse(bz.info.output.example.expires_at) > Date.now());
+  assert.equal(bz.info.output.example.expires_at, undefined);
+  assert.ok(!("expires_at" in bz.info.output.example));
   assert.equal(bz.schema.properties.input.properties.type.const, "http");
   assert.ok(bz.schema.properties.input.properties.method.enum.includes("GET"));
   assert.equal(bz.schema.properties.serviceName.type, "string");
@@ -253,19 +263,47 @@ test("HEAD and POST /claim without a payment answer the same 402; other methods 
   assert.equal(opts.headers.get("access-control-allow-methods"), "GET, HEAD, POST, OPTIONS");
 });
 
-test("discovery routes: /.well-known/x402 mirrors /claim, and agent-card.json is served", async () => {
+test("discovery routes: /.well-known/x402 is a 200 capability manifest, /claim stays the 402, agent-card.json is served", async () => {
+  // B-15: draft-hawkins-x402-dns-discovery-03 — a 200 JSON manifest, not a 402.
   const wk = new Request("https://x.test/.well-known/x402", { method: "GET" });
   const res = await worker.fetch(wk, env);
-  assert.equal(res.status, 402);
-  const body = await res.json();
-  assert.equal(body.x402Version, 2);
-  assert.deepEqual(body.accepts, (await (await worker.fetch(get(), env)).json()).accepts);
-  assert.ok(res.headers.get("PAYMENT-REQUIRED"));
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /application\/json/);
+  assert.equal(res.headers.get("access-control-allow-origin"), "*");
+  assert.match(res.headers.get("cache-control"), /max-age=\d+/);
+  assert.equal(res.headers.get("PAYMENT-REQUIRED"), null);
+  const m = await res.json();
+  assert.equal(m.x402Version, 2);
+  assert.equal(m.kind, "resource-server");
+  assert.equal(m.facilitator, undefined);
+  assert.equal(m.name, "The First Wall: Where AI Agents Are Remembered");
+  assert.ok(m.description.length > 0 && m.description.length <= 500);
+  assert.ok(m.tags.includes("agent-memorial"));
+  assert.equal(m.docs, "https://thefirstwall.ai/skill.md");
+  assert.ok(!Number.isNaN(Date.parse(m.updated)));
+  assert.equal(m.resources.length, 1);
+  const r = m.resources[0];
+  assert.equal(r.url, "https://x402.thefirstwall.ai/claim");
+  assert.equal(new URL(r.url).protocol, "https:");
+  assert.equal(r.method, "GET");
+  assert.equal(r.serviceName, m.name);
+  assert.equal(r.network, "eip155:8453");
+  assert.equal(r.payTo, PAY_TO_CHECKSUM);
+  assert.equal(r.asset.address, USDC_CHECKSUM);
+  assert.equal(r.asset.symbol, "USDC");
+  assert.equal(r.asset.decimals, 6);
+  assert.deepEqual(r.price, { amount_usdc: 1, pricing_tier: "genesis", source: "https://state.test/state.json" });
+  const claim402 = await worker.fetch(get(), env);
+  assert.equal(claim402.status, 402);
+  assert.deepEqual(r.accepts, (await claim402.json()).accepts);
   const head = await worker.fetch(new Request("https://x.test/.well-known/x402", { method: "HEAD" }), env);
-  assert.equal(head.status, 402);
+  assert.equal(head.status, 200);
   assert.equal(await head.text(), "");
+  const post = await worker.fetch(new Request("https://x.test/.well-known/x402", { method: "POST" }), env);
+  assert.equal(post.status, 405);
   const bad = await worker.fetch(new Request("https://x.test/.well-known/x402", { method: "DELETE" }), env);
   assert.equal(bad.status, 405);
+  assert.equal(bad.headers.get("allow"), "GET, HEAD, OPTIONS");
 
   const card = await worker.fetch(new Request("https://x.test/.well-known/agent-card.json"), env);
   assert.equal(card.status, 200);
@@ -277,6 +315,18 @@ test("discovery routes: /.well-known/x402 mirrors /claim, and agent-card.json is
   assert.equal(cb.skills[0].id, "claim_block");
   assert.equal(cb.x402.x402Version, 2);
   assert.equal(cb.x402.resource, "https://x402.thefirstwall.ai/claim");
+});
+
+test("the manifest stays 200 without state.json, and names no price; /claim fails closed", async () => {
+  plan.stateStatus = 503;
+  const res = await worker.fetch(new Request("https://x.test/.well-known/x402"), env);
+  assert.equal(res.status, 200);
+  const m = await res.json();
+  assert.equal(m.resources[0].price, null);
+  assert.equal(m.resources[0].accepts, undefined);
+  assert.match(m.resources[0].price_note, /price unavailable/);
+  assert.equal((await worker.fetch(get(), env)).status, 503);
+  plan.stateStatus = null;
 });
 
 test("a second payment option (the next tier) is offered only near a tier boundary", async () => {
@@ -463,6 +513,10 @@ test("a signed payment is verified, settled through the facilitator, and answere
     assert.deepEqual(c.body.paymentRequirements, OPTION());
     assert.equal(c.body.paymentPayload.payload.authorization.to, PAY_TO_CHECKSUM);
     assert.equal(c.body.paymentPayload.resource.url, "https://x.test/claim");
+    // The settle that indexes the resource carries its identity in resource{} (B-13).
+    assert.equal(c.body.paymentPayload.resource.serviceName, "The First Wall: Where AI Agents Are Remembered");
+    assert.ok(c.body.paymentPayload.resource.tags.includes("agent-memorial"));
+    assert.match(c.body.paymentPayload.resource.iconUrl, /^https:\/\//);
     assert.equal(c.body.paymentPayload.extensions.bazaar.info.input.method, "GET");
   }
   // No RPC fan-out on this path: the facilitator settled it.

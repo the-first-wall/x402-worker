@@ -45,7 +45,7 @@ x402-worker/
 | `HEAD /claim` | The same `402` headers, no body. |
 | `GET` or `POST /claim` + `PAYMENT-SIGNATURE` with a signed x402 v2 `exact` payload | The worker checks the payment against its own offer, asks the CDP facilitator to **verify** and **settle** it, and answers `200` with the receipt and `PAYMENT-RESPONSE`. |
 | `GET` or `POST /claim` + `X-PAYMENT` (or `PAYMENT-SIGNATURE`) carrying a **settled transaction hash** | The agent paid by plain transfer: the worker verifies it **statelessly on Base RPC** (below) and answers with the receipt. |
-| `GET`/`HEAD`/`POST` `/.well-known/x402` | The same paid resource as `/claim`, at the conventional discovery path that x402 directories probe (`402` when unpaid). |
+| `GET`/`HEAD` `/.well-known/x402` | `200` JSON capability manifest per [draft-hawkins-x402-dns-discovery-03](https://datatracker.ietf.org/doc/draft-hawkins-x402-dns-discovery/) (`kind: "resource-server"`): name, description, tags, icon, and the `/claim` resource with its live price, network, asset, `payTo` and `accepts[]`, plus docs/ledger/state links. Never a `402` — the `402` belongs to `/claim`. Without a readable `state.json` it still answers `200`, with `price: null`. |
 | `GET /.well-known/agent-card.json` | An A2A-style agent card: name, skill, and the x402 / state / ledger endpoints. |
 | `GET /healthz` | `{"ok":true}` |
 | `GET /` | `302` → <https://thefirstwall.ai> |
@@ -273,7 +273,12 @@ cast call 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 "version()(string)" --rpc-u
 [Bazaar extension](https://github.com/coinbase/x402/blob/main/specs/extensions/bazaar.md)
 (`{info, schema}`; a `GET` input, a receipt-shaped example output, and a schema that
 validates `info`), and `resource.description` (≤ 500 characters) says what the route
-does and when to call it. Per
+does and when to call it. The listing's identity — `serviceName`, `tags`, `iconUrl` —
+is carried **in `resource{}`** (as well as in `extensions.bazaar.info`): the CDP catalogue
+lifts these from `resource`, and a record without them cannot win a name query. The
+vocabulary is the memory angle (`SERVICE_NAME` / `SERVICE_TAGS`), not identity/registry.
+The example receipt carries no `expires_at`: the catalogue stores a snapshot taken at
+index time, and an absolute expiry would read as already expired. Per
 [Get discovered (Bazaar)](https://docs.cdp.coinbase.com/x402/seller/get-discovered):
 
 1. **Deploy** the route to a public HTTPS URL (section (b)).
@@ -345,10 +350,11 @@ Resolved from the specs (x402 `specs/x402-specification-v2.md`, `specs/transport
 2. **The `uri` claim format** (`METHOD host/path`) comes from CDP's authentication
    guide; the first live call confirms it. A wrong format shows up as the facilitator
    refusing the credentials (`503`, "refused this worker's credentials").
-3. **`bazaar` fields.** The extension spec defines `info.input` and `info.output`
-   (`type`, `example`); it does not define `name` or `tags`, so none are emitted. The
-   description lives in `resource.description`. Whether the catalog reads anything
-   beyond what the spec lists is undocumented.
+3. **`bazaar` / `resource` fields.** The extension spec defines `info.input` and
+   `info.output` (`type`, `example`). `serviceName`, `tags` and `iconUrl` are not in the
+   core `ResourceInfo` spec, but the CDP catalogue reads them from `resource` (observed on
+   ranked records, 2026-10-21), so they are emitted there and kept under
+   `extensions.bazaar.info` too; unknown fields are ignored by spec-following clients.
 4. **Settle with no answer.** The transfer may have been broadcast. The worker says so
    instead of guessing, and the plain-transfer path is the way to recover.
 5. **Amount semantics.** The `exact` scheme needs the exact amount, so a signed payment
