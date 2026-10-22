@@ -1,0 +1,93 @@
+# Deliberate, manual deploy of the worker to x402.thefirstwall.ai.
+#
+# Why this is NOT wired to `push`: a merge is not a deploy. This route is a
+# money-adjacent public endpoint, and the URL it advertises (`resource.url`, indexed
+# by the x402 Bazaar, published as `links.x402_claim` in the ledger's state.json) has
+# to move in lockstep with the ledger. An unattended deploy could go live before the
+# ledger publishes the matching state, and an indexed discovery URL is sticky.
+#
+# So: a human presses the button, and the run only goes green once the live route is
+# proven to be serving the new version.
+#
+# Required repository configuration (Settings -> Secrets and variables -> Actions):
+#   Secret   CLOUDFLARE_API_TOKEN   account-scoped token, "Workers Scripts: Edit" only
+#   Variable CLOUDFLARE_ACCOUNT_ID  the account id (public; visible in the dashboard URL)
+#
+# Both are supplied at deploy time, so `wrangler.toml` stays account-free and the
+# `secret-scan` workflow keeps passing.
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy" to confirm a LIVE deploy to x402.thefirstwall.ai'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# One live deploy at a time; never cancel one mid-flight.
+concurrency:
+  group: deploy-x402
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Add a required reviewer to this environment to gate a deploy on a human approval.
+    environment: production
+    steps:
+      - name: Require explicit confirmation
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.confirm }}" != "deploy" ]; then
+            echo "::error::the confirm input must be exactly 'deploy'"
+            exit 1
+          fi
+          echo "confirmed: deploying ${{ github.ref_name }} @ ${{ github.sha }}"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Never ship code that fails its own tests.
+      - name: Unit tests
+        run: npm test
+
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: 'false'
+          CI: 'true'
+        run: npx --yes wrangler@4 deploy
+
+      # `wrangler deploy` exiting 0 proves an upload, not a rollout: a deploy spreads
+      # across edge isolates over roughly a minute and a single request can still be
+      # answered by a stale isolate running the old version. Sample many times and
+      # check the BODY (the deployed resource.url), not just the status code.
+      - name: Prove the new version is actually serving
+        run: |
+          set -euo pipefail
+          URL="https://x402.thefirstwall.ai/claim"
+          EXPECTED='"url"[[:space:]]*:[[:space:]]*"https://x402.thefirstwall.ai/claim"'
+          ok=0
+          samples=20
+          for i in $(seq 1 "$samples"); do
+            body=$(mktemp)
+            code=$(curl -sS -o "$body" -w '%{http_code}' "$URL?deploy-check=$i-$RANDOM" || true)
+            if [ "$code" = "402" ] && grep -qE "$EXPECTED" "$body"; then
+              ok=$((ok + 1))
+            fi
+            rm -f "$body"
+            sleep 3
+          done
+          echo "samples answering 402 with the advertised resource.url: $ok/$samples"
+          if [ "$ok" -lt 18 ]; then
+            echo "::error::post-deploy verification failed — the edge may still be serving an older version. Re-check in a minute before retrying."
+            exit 1
+          fi

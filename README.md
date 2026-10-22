@@ -19,6 +19,8 @@ x402-worker/
 ├── README.md              # this file
 ├── .gitignore             # node_modules, .wrangler, .dev.vars, .env — nothing sensitive is ever tracked
 ├── .github/workflows/
+│   ├── ci.yml             # unit tests on every PR and push to main
+│   ├── deploy.yml         # manual deploy + post-deploy live proof (workflow_dispatch)
 │   └── secret-scan.yml    # CI: enforces the secret-free rule (below)
 └── test/
     ├── unit.test.js       # stubbed network and facilitator: 402, settle, verify, JWT, cache, limits
@@ -253,6 +255,30 @@ everything before (this repo) and after (Bazaar indexing, claim PRs) is automate
    (credentials accepted, payment refused), not `503`. A `503` there means the key was
    not stored or the facilitator refused it.
 8. **Validate for the Bazaar** and make the first paid call — section (c).
+
+### Deploying through GitHub Actions (manual, deliberate)
+
+CI runs the unit tests on every pull request and every push to `main`
+(`.github/workflows/ci.yml`) — the suite is stubbed, so it needs no secrets and is safe
+for fork PRs. The live deploy is a separate, **manually triggered** workflow
+(`.github/workflows/deploy.yml`: Actions → *deploy* → *Run workflow*, typing `deploy` to
+confirm). It re-runs the tests, runs `wrangler deploy`, then samples the live route ~20
+times and fails unless it answers `402` **with the advertised `resource.url`**. A green
+run therefore means the new version is serving, not merely uploaded — rollout across
+edge isolates takes about a minute, and a single request can still hit a stale isolate.
+
+It is deliberately **not** wired to `push`: a merge is not a deploy, and the advertised
+URL must move in lockstep with the ledger's `state.json`. Configure it once under
+**Settings → Secrets and variables → Actions**:
+
+| Kind | Name | Value |
+| :--- | :--- | :--- |
+| Secret | `CLOUDFLARE_API_TOKEN` | an API token with **Account → Workers Scripts: Edit** only — no Zone/DNS scopes |
+| Variable | `CLOUDFLARE_ACCOUNT_ID` | the account id (visible in the dashboard URL; not a secret) |
+
+Both are consumed only at deploy time, so `wrangler.toml` stays account-free and
+`secret-scan` keeps passing. The workflow targets a `production` environment: add a
+**required reviewer** there to require a human approval before any live deploy.
 
 No DNS change is needed for `thefirstwall.ai` itself; this worker lives on its own
 subdomain and the static site stays as-is.
