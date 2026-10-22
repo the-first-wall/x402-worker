@@ -1,0 +1,23 @@
+name: card-drift
+
+# B-17: fail when the worker's agent card diverges from the canonical discovery
+# metadata in the ledger repo. Read-only; no secrets, no deploy.
+on:
+  pull_request:
+    paths: ["index.js", "scripts/**", "test/**", "package.json", ".github/workflows/card-drift.yml"]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  card-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+      - name: agent card vs canonical discovery metadata
+        # Warn-only while the ledger's discovery/agent-card.json is absent (404); append --strict (npm run check:drift -- --strict) once it lands.
+        run: npm run check:drift
