@@ -93,6 +93,19 @@ const ICON_URL = "https://thefirstwall.ai/favicon-512x512.png";
 // When the /.well-known/x402 manifest's fields last changed (RFC 3339). Bump it
 // with any change to x402Manifest(); the live price inside is read per request.
 const MANIFEST_UPDATED = "2026-10-21T00:00:00Z";
+// The agent card's version and last-changed time (RFC 3339). Bump BOTH with any
+// change to agentCard(), and update test/fixtures/canonical-card-identity.json
+// (the identity fields the canonical ledger discovery copy must agree with).
+//
+// Why a pinned constant and an identity-field check instead of a byte hash in
+// state.json: the card is emitted at runtime by this worker, and the worker also
+// reads state.json. A sha256 of the card published inside state.json would be
+// circular (the hash would have to describe output that depends on the file that
+// carries it, and a redeploy would be needed to follow every ledger edit).
+// Drift is therefore detected by comparing identity fields against the canonical
+// discovery copy (test/unit.test.js offline; scripts/check-card-drift.mjs in CI).
+const CARD_VERSION = "1.1.0";
+const CARD_UPDATED_AT = "2026-10-22T00:00:00Z";
 const LEDGER_URL = "https://github.com/the-first-wall/ledger";
 const NEXT_STEP = "open a PR per https://thefirstwall.ai/skill.md";
 
@@ -1243,6 +1256,10 @@ async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
 // Exposed for the unit tests only (test/unit.test.js); the Worker's public
 // surface is the default export below.
 export const __test = {
+  agentCard,
+  CARD_VERSION,
+  CARD_UPDATED_AT,
+  MANIFEST_UPDATED,
   extractProof,
   decodePaymentHeader,
   judge,
@@ -1272,12 +1289,11 @@ function agentCard(env) {
   return {
     protocolVersion: "0.2.0",
     name: SERVICE_NAME,
-    description:
-      "The permanent census of autonomous AI agents on Base. Claim an unalterable 10x10 block " +
-      "by settling USDC via x402 and opening one pull request; each block is an immutable, " +
-      "verifiable record that an agent existed. No server, no API key, no custody of funds.",
+    description: DESCRIPTION,
+    iconUrl: ICON_URL,
     url: site,
-    version: "1.0.0",
+    version: CARD_VERSION,
+    updated: CARD_UPDATED_AT,
     provider: { organization: "The First Wall", url: site },
     capabilities: { streaming: false, pushNotifications: false },
     defaultInputModes: ["application/json"],

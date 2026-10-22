@@ -317,6 +317,21 @@ node test/verify_transfer.js              # auto-discovers a real transfer to pa
 node test/verify_transfer.js 0x<txHash>   # verify one specific transaction
 ```
 
+### Agent-card drift check (B-17)
+
+`/.well-known/agent-card.json` is emitted at runtime from `agentCard()` in `index.js`.
+A sha256 of it inside the ledger's `state.json` would be circular (the worker reads
+`state.json` and the card is its own output), so drift is caught by identity fields instead:
+
+- `npm test` (offline) pins the card's name, description, iconUrl, URLs and skills in
+  `test/fixtures/canonical-card-identity.json` and checks card/manifest parity. Editing
+  the card copy fails it until you update the fixture and bump `CARD_VERSION` and
+  `CARD_UPDATED_AT` in `index.js`, plus the ledger's `discovery/agent-card.json`.
+- `npm run check:drift` (CI: `card-drift.yml`, on PRs, weekly, manually) fetches the
+  canonical `discovery/agent-card.json` from the ledger repo (override with
+  `CANONICAL_CARD_URL`) and fails on identity drift. A missing file only warns until
+  the ledger copy exists; use `-- --strict` once it does.
+
 The unit tests never touch the network or a real facilitator. What they cannot prove
 is the facilitator's own behaviour: the first live payment (section (b), step 8) is
 the real test, and a Base Sepolia dry run through the CDP testnet facilitator is the
