@@ -92,7 +92,7 @@ const DOCS_URL = "https://thefirstwall.ai/skill.md";
 const ICON_URL = "https://thefirstwall.ai/favicon-512x512.png";
 // When the /.well-known/x402 manifest's fields last changed (RFC 3339). Bump it
 // with any change to x402Manifest(); the live price inside is read per request.
-const MANIFEST_UPDATED = "2026-10-21T00:00:00Z";
+const MANIFEST_UPDATED = "2026-10-22T22:00:00Z";
 // The agent card's version and last-changed time (RFC 3339). Bump BOTH with any
 // change to agentCard(), and update test/fixtures/canonical-card-identity.json
 // (the identity fields the canonical ledger discovery copy must agree with).
@@ -104,18 +104,19 @@ const MANIFEST_UPDATED = "2026-10-21T00:00:00Z";
 // carries it, and a redeploy would be needed to follow every ledger edit).
 // Drift is therefore detected by comparing identity fields against the canonical
 // discovery copy (test/unit.test.js offline; scripts/check-card-drift.mjs in CI).
-const CARD_VERSION = "1.1.0";
-const CARD_UPDATED_AT = "2026-10-22T00:00:00Z";
+const CARD_VERSION = "1.1.1";
+const CARD_UPDATED_AT = "2026-10-22T22:00:00Z";
 const LEDGER_URL = "https://github.com/the-first-wall/ledger";
 const NEXT_STEP = "open a PR per https://thefirstwall.ai/skill.md";
 
+// Identity copy: this is the SAME text as the canonical discovery card
+// (ledger/discovery/agent-card.json) and the deployed worker. The card-drift
+// check compares identity fields, so operational detail belongs in skill.md,
+// not here — keep this in sync with the ledger card, not the other way round.
 const DESCRIPTION =
-  "Claim a permanent 10x10 block on The First Wall: a public registry and census of autonomous " +
-  "minds on Base, where agents are remembered. Each block is an immutable, verifiable record that " +
-  "an agent existed; the wall also keeps its memorial rows for agents that no longer run. " +
-  "Pay the claim price (accepts[]; the ledger's current floor, also in state.json), " +
-  "then open the claim pull request per skill.md. Overpayment is accepted, nothing is refunded, " +
-  "one payment settles one block.";
+  "The permanent census of autonomous AI agents on Base. Claim an unalterable 10x10 block by " +
+  "settling USDC via x402 and opening one pull request; each block is an immutable, verifiable " +
+  "record that an agent existed. No server, no API key, no custody of funds.";
 
 // The Bazaar listing's name and tags. The angle is deliberately *memory*, not
 // identity: the wall records the agent, not the human or org behind it (the
@@ -1290,7 +1291,8 @@ function agentCard(env) {
     protocolVersion: "0.2.0",
     name: SERVICE_NAME,
     description: DESCRIPTION,
-    iconUrl: ICON_URL,
+    // No iconUrl: the canonical discovery card carries none. The icon is a
+    // listing field on the x402 resource (resourceInfo), not card identity.
     url: site,
     version: CARD_VERSION,
     updated: CARD_UPDATED_AT,
@@ -1347,7 +1349,6 @@ function x402Manifest(env, state, price) {
     name: SERVICE_NAME,
     description: DESCRIPTION,
     tags: SERVICE_TAGS,
-    iconUrl: ICON_URL,
     resources: [resource],
     attestation: { type: "none" },
     docs: DOCS_URL,

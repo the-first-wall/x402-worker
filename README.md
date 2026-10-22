@@ -349,7 +349,8 @@ node test/verify_transfer.js 0x<txHash>   # verify one specific transaction
 A sha256 of it inside the ledger's `state.json` would be circular (the worker reads
 `state.json` and the card is its own output), so drift is caught by identity fields instead:
 
-- `npm test` (offline) pins the card's name, description, iconUrl, URLs and skills in
+- `npm test` (offline) pins the card's name, description, URLs and skills (icon
+  deliberately absent, as on the canonical card) in
   `test/fixtures/canonical-card-identity.json` and checks card/manifest parity. Editing
   the card copy fails it until you update the fixture and bump `CARD_VERSION` and
   `CARD_UPDATED_AT` in `index.js`, plus the ledger's `discovery/agent-card.json`.
