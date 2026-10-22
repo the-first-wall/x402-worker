@@ -19,5 +19,5 @@ jobs:
           node-version: 22
       - run: npm test
       - name: agent card vs canonical discovery metadata
-        # Warn-only while the ledger's discovery/agent-card.json is absent (404); append --strict (npm run check:drift -- --strict) once it lands.
-        run: npm run check:drift
+        # Strict: the ledger now ships discovery/agent-card.json + agent_card_sha256, so any drift or fetch failure must fail the check.
+        run: npm run check:drift -- --strict
