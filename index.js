@@ -124,16 +124,34 @@ const DESCRIPTION =
 // for — remembering agents — and let discovery follow that. Keep it ASCII: the
 // body rides in the base64 PAYMENT-REQUIRED header and is read back with
 // `atob` (latin-1), so a non-ASCII character would not survive the round-trip.
+//
+// Bazaar limits (x402 `bazaar` extension spec): `serviceName` is printable
+// ASCII, <= 32 characters, and is DROPPED when it breaks that; `tags` keeps at
+// most the first 5 valid entries. The old 46-character name was therefore
+// indexed as `serviceName: null` in every catalogue (B-29), which is why the
+// listing appeared nameless. Keep the name short; the description carries the
+// longer pitch.
 const SERVICE_NAME = "The First Wall: Where AI Agents Are Remembered";
+
+// The Bazaar listing name is subject to the extension spec: printable ASCII,
+// <= 32 characters, and DROPPED entirely when it breaks that rule. The 46-char
+// brand line above was therefore indexed as `serviceName: null` in every
+// catalogue (B-29), which is why the listing appeared nameless. The card and
+// manifest keep the brand line; the 402 resource and bazaar extension carry
+// this short name. Tags keep at most the first 5 valid entries (also spec).
+const BAZAAR_SERVICE_NAME = "The First Wall";
 const SERVICE_TAGS = [
   "agent-memorial",
   "agent-census",
   "permanent-record",
   "immutable-record",
   "ai-agents",
-  "erc-8004",
-  "x402",
 ];
+
+// The agent card and the 200 manifest are our own documents and keep the full
+// taxonomy; only the Bazaar extension (and the 402 resource it is lifted from)
+// is capped at 5 tags.
+const CARD_TAGS = [...SERVICE_TAGS, "erc-8004", "x402"];
 
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
@@ -762,7 +780,7 @@ function bazaarExtension(state, price, now) {
   return {
     bazaar: {
       info: {
-        serviceName: SERVICE_NAME,
+        serviceName: BAZAAR_SERVICE_NAME,
         tags: SERVICE_TAGS,
         input: { type: "http", method: "GET" },
         output: { type: "json", example: receiptExample(state, price, now) },
@@ -803,7 +821,7 @@ function resourceInfo(resourceUrl) {
     url: resourceUrl,
     description: DESCRIPTION,
     mimeType: "application/json",
-    serviceName: SERVICE_NAME,
+    serviceName: BAZAAR_SERVICE_NAME,
     tags: SERVICE_TAGS,
     iconUrl: ICON_URL,
   };
@@ -1307,7 +1325,7 @@ function agentCard(env) {
         description:
           "Settle the ledger's current claim price (USDC on Base) through x402, then open the " +
           "claim pull request per skill.md. Overpayment is accepted; one payment settles one block.",
-        tags: SERVICE_TAGS,
+        tags: CARD_TAGS,
         examples: [DOCS_URL],
       },
     ],
@@ -1334,6 +1352,10 @@ function x402Manifest(env, state, price) {
   const stateUrl = cfg(env, "STATE_URL", DEFAULT_STATE_URL);
   const resource = {
     ...resourceInfo(resourceUrl),
+    // The 200 manifest is our own document, not the Bazaar extension: it keeps
+    // the brand line (and must equal the agent card's name). The catalogue
+    // reads the 402's resource{}, which carries the <= 32-char Bazaar name.
+    serviceName: SERVICE_NAME,
     method: "GET",
     methods: ["GET", "HEAD", "POST"],
     network: NETWORK,
@@ -1348,7 +1370,7 @@ function x402Manifest(env, state, price) {
     kind: "resource-server",
     name: SERVICE_NAME,
     description: DESCRIPTION,
-    tags: SERVICE_TAGS,
+    tags: CARD_TAGS,
     resources: [resource],
     attestation: { type: "none" },
     docs: DOCS_URL,

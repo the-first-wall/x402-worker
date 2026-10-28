@@ -204,7 +204,7 @@ test("GET /claim answers 402 with the x402 v2 PaymentRequired, the floor, and th
   assert.ok(body.resource.description.length <= 500);
   // B-13: the catalogue lifts service identity from resource{}, so it is there,
   // in the same memory-angle vocabulary as the Bazaar block.
-  assert.equal(body.resource.serviceName, "The First Wall: Where AI Agents Are Remembered");
+  assert.equal(body.resource.serviceName, "The First Wall");
   assert.deepEqual(body.resource.tags, body.extensions.bazaar.info.tags);
   assert.ok(body.resource.tags.includes("agent-memorial"));
   assert.ok(!body.resource.tags.some((t) => /registry|identity/.test(t)), "memory, not identity/registry");
@@ -225,7 +225,7 @@ test("GET /claim answers 402 with the x402 v2 PaymentRequired, the floor, and th
   assert.match(res.headers.get("access-control-expose-headers"), /PAYMENT-REQUIRED/);
   // Discovery: a GET input, an example output, and a schema that validates info.
   const bz = body.extensions.bazaar;
-  assert.equal(bz.info.serviceName, "The First Wall: Where AI Agents Are Remembered");
+  assert.equal(bz.info.serviceName, "The First Wall");
   assert.ok(Array.isArray(bz.info.tags) && bz.info.tags.length > 0);
   assert.ok(bz.info.tags.includes("agent-memorial"));
   assert.deepEqual(bz.info.input, { type: "http", method: "GET" });
@@ -514,7 +514,7 @@ test("a signed payment is verified, settled through the facilitator, and answere
     assert.equal(c.body.paymentPayload.payload.authorization.to, PAY_TO_CHECKSUM);
     assert.equal(c.body.paymentPayload.resource.url, "https://x.test/claim");
     // The settle that indexes the resource carries its identity in resource{} (B-13).
-    assert.equal(c.body.paymentPayload.resource.serviceName, "The First Wall: Where AI Agents Are Remembered");
+    assert.equal(c.body.paymentPayload.resource.serviceName, "The First Wall");
     assert.ok(c.body.paymentPayload.resource.tags.includes("agent-memorial"));
     assert.match(c.body.paymentPayload.resource.iconUrl, /^https:\/\//);
     assert.equal(c.body.paymentPayload.extensions.bazaar.info.input.method, "GET");
@@ -688,4 +688,31 @@ test("a facilitator 429 is retryable, and the receipt states what was signed, no
   const body = await res.json();
   assert.equal(body.amount_usdc, 1, "the signed and offered amount, not the echoed 1 base unit");
   assert.equal(body.payer, PAYER, "the signer of the authorization when the echoed payer is not an address");
+});
+
+// B-29: the Bazaar `bazaar` extension spec (coinbase/x402 specs/extensions/bazaar.md)
+// DROPS a serviceName longer than 32 printable-ASCII characters and keeps at most the
+// first 5 valid tags. The previous name was 46 characters, so every catalogue indexed
+// our listing as `serviceName: null` while the 402 body looked correct. Guard the limits.
+test("Bazaar resource metadata stays inside the extension spec's limits", () => {
+  const resource = w.paymentRequired("https://x402.thefirstwall.ai/claim", { units: 1_000_000n }).resource;
+  const printableAscii = (s) => typeof s === "string" && /^[\x20-\x7e]+$/.test(s);
+
+  assert.ok(printableAscii(resource.serviceName), "serviceName must be non-empty printable ASCII");
+  assert.ok(
+    resource.serviceName.length <= 32,
+    `serviceName must be <= 32 chars or the indexer drops it (got ${resource.serviceName.length}: ${resource.serviceName})`,
+  );
+
+  assert.ok(Array.isArray(resource.tags), "tags must be an array");
+  assert.ok(resource.tags.length <= 5, `tags must be <= 5 entries or the indexer truncates (got ${resource.tags.length})`);
+  for (const tag of resource.tags) {
+    assert.ok(printableAscii(tag), `tag ${JSON.stringify(tag)} must be printable ASCII`);
+    assert.ok(tag.length <= 32, `tag ${JSON.stringify(tag)} must be <= 32 chars`);
+  }
+  const lowered = resource.tags.map((t) => t.toLowerCase());
+  assert.equal(new Set(lowered).size, lowered.length, "tags must be unique case-insensitively");
+
+  // The extension and the resource must not drift apart.
+  assert.equal(w.paymentRequired("https://x402.thefirstwall.ai/claim", { units: 1_000_000n }).extensions.bazaar.info.serviceName, resource.serviceName);
 });
