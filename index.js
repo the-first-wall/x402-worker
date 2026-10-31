@@ -90,9 +90,13 @@ const DEFAULT_FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402";
 const DEFAULT_RESOURCE_URL = "https://x402.thefirstwall.ai/claim";
 const DOCS_URL = "https://thefirstwall.ai/skill.md";
 const ICON_URL = "https://thefirstwall.ai/favicon-512x512.png";
-// When the /.well-known/x402 manifest's fields last changed (RFC 3339). Bump it
-// with any change to x402Manifest(); the live price inside is read per request.
-const MANIFEST_UPDATED = "2026-10-22T22:00:00Z";
+// When the /.well-known/x402 manifest's bytes last changed (RFC 3339). Bump it
+// with ANY change to x402Manifest(), and update the pinned sha256 in
+// test/canonical-hashes.test.js and the README.
+const MANIFEST_UPDATED = "2026-10-31T00:00:00Z";
+// Stable public contact for the manifest (draft-hawkins-x402-dns-discovery-03):
+// the ledger's issue tracker. The worker is stateless and has no mailbox.
+const CONTACT_URL = "https://github.com/the-first-wall/ledger/issues";
 // The agent card's version and last-changed time (RFC 3339). Bump BOTH with any
 // change to agentCard(), and update test/fixtures/canonical-card-identity.json
 // (the identity fields the canonical ledger discovery copy must agree with).
@@ -1276,6 +1280,7 @@ async function handlePaidClaim(request, env, resourceUrl, now = Date.now()) {
 // surface is the default export below.
 export const __test = {
   agentCard,
+  x402Manifest,
   CARD_VERSION,
   CARD_UPDATED_AT,
   MANIFEST_UPDATED,
@@ -1342,16 +1347,17 @@ function agentCard(env) {
 // The x402 capability manifest at /.well-known/x402
 // (draft-hawkins-x402-dns-discovery-03, section 3): public, 200, application/json.
 // A 402 belongs to the priced resource (/claim), not to the manifest. We are a
-// resource server only — the facilitator is CDP's, and the draft requires a
-// declared facilitator.baseUrl to be on our own domain — so no facilitator
-// block. The price is the ledger's live floor from (cached) state.json; when
-// it cannot be read the manifest says so instead of naming one.
-function x402Manifest(env, state, price) {
-  const site = cfg(env, "SITE_URL", DEFAULT_SITE_URL);
-  const resourceUrl = cfg(env, "RESOURCE_URL", DEFAULT_RESOURCE_URL);
-  const stateUrl = cfg(env, "STATE_URL", DEFAULT_STATE_URL);
+// resource server only; the facilitator is CDP's, and the draft requires a
+// declared facilitator.baseUrl to be on our own domain, so no facilitator block.
+//
+// STATIC BY DESIGN: a pure function of module constants (no env, no state.json,
+// no clock, no price). The ledger and the web apex mirror these bytes verbatim and
+// pin their sha256 (test/canonical-hashes.test.js), so they must be deploy-stable.
+// The authoritative price lives only in the /claim 402 PAYMENT-REQUIRED challenge
+// and in the ledger's state.json (linked below as `state`).
+function x402Manifest() {
   const resource = {
-    ...resourceInfo(resourceUrl),
+    ...resourceInfo(DEFAULT_RESOURCE_URL),
     // The 200 manifest is our own document, not the Bazaar extension: it keeps
     // the brand line (and must equal the agent card's name). The catalogue
     // reads the 402's resource{}, which carries the <= 32-char Bazaar name.
@@ -1361,10 +1367,7 @@ function x402Manifest(env, state, price) {
     network: NETWORK,
     payTo: PAY_TO,
     asset: { network: NETWORK, address: USDC_CONTRACT, symbol: "USDC", decimals: USDC_DECIMALS, standard: "EIP-3009" },
-    price: price ? { amount_usdc: price.usdc, pricing_tier: price.tier, source: stateUrl } : null,
   };
-  if (price) resource.accepts = acceptsFor(price);
-  else resource.price_note = `price unavailable: state.json could not be read; the live price is in the 402 at ${resourceUrl}`;
   return {
     x402Version: 2,
     kind: "resource-server",
@@ -1375,17 +1378,16 @@ function x402Manifest(env, state, price) {
     attestation: { type: "none" },
     docs: DOCS_URL,
     ledger: LEDGER_URL,
-    state: stateUrl,
-    agentCard: new URL("/.well-known/agent-card.json", resourceUrl).toString(),
-    site,
+    state: DEFAULT_STATE_URL,
+    agentCard: new URL("/.well-known/agent-card.json", DEFAULT_RESOURCE_URL).toString(),
+    site: DEFAULT_SITE_URL,
+    contact: CONTACT_URL,
     updated: MANIFEST_UPDATED,
   };
 }
 
-async function respondManifest(env, head = false) {
-  const state = await loadState(env, Date.now());
-  const manifest = x402Manifest(env, state, priceFromState(state));
-  return json(head ? null : manifest, 200, { "cache-control": "public, max-age=60" });
+function respondManifest(head = false) {
+  return json(head ? null : x402Manifest(), 200, { "cache-control": "public, max-age=60" });
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,7 +1424,7 @@ export default {
 
     // The capability manifest: 200, never 402 (B-15).
     if (url.pathname === "/.well-known/x402") {
-      if (method === "GET" || method === "HEAD") return respondManifest(env, method === "HEAD");
+      if (method === "GET" || method === "HEAD") return respondManifest(method === "HEAD");
       return json({ error: "method not allowed" }, 405, { allow: "GET, HEAD, OPTIONS" });
     }
 

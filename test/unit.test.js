@@ -292,10 +292,10 @@ test("discovery routes: /.well-known/x402 is a 200 capability manifest, /claim s
   assert.equal(r.asset.address, USDC_CHECKSUM);
   assert.equal(r.asset.symbol, "USDC");
   assert.equal(r.asset.decimals, 6);
-  assert.deepEqual(r.price, { amount_usdc: 1, pricing_tier: "genesis", source: "https://state.test/state.json" });
-  const claim402 = await worker.fetch(get(), env);
-  assert.equal(claim402.status, 402);
-  assert.deepEqual(r.accepts, (await claim402.json()).accepts);
+  // Static by design: price lives in the 402 challenge, not the manifest.
+  assert.equal(r.price, undefined);
+  assert.equal(r.accepts, undefined);
+  assert.equal((await worker.fetch(get(), env)).status, 402);
   const head = await worker.fetch(new Request("https://x.test/.well-known/x402", { method: "HEAD" }), env);
   assert.equal(head.status, 200);
   assert.equal(await head.text(), "");
@@ -317,14 +317,13 @@ test("discovery routes: /.well-known/x402 is a 200 capability manifest, /claim s
   assert.equal(cb.x402.resource, "https://x402.thefirstwall.ai/claim");
 });
 
-test("the manifest stays 200 without state.json, and names no price; /claim fails closed", async () => {
+test("the manifest stays 200 without state.json (static, no price); /claim fails closed", async () => {
   plan.stateStatus = 503;
   const res = await worker.fetch(new Request("https://x.test/.well-known/x402"), env);
   assert.equal(res.status, 200);
   const m = await res.json();
-  assert.equal(m.resources[0].price, null);
+  assert.equal(m.resources[0].price, undefined);
   assert.equal(m.resources[0].accepts, undefined);
-  assert.match(m.resources[0].price_note, /price unavailable/);
   assert.equal((await worker.fetch(get(), env)).status, 503);
   plan.stateStatus = null;
 });
