@@ -47,7 +47,7 @@ x402-worker/
 | `HEAD /claim` | The same `402` headers, no body. |
 | `GET` or `POST /claim` + `PAYMENT-SIGNATURE` with a signed x402 v2 `exact` payload | The worker checks the payment against its own offer, asks the CDP facilitator to **verify** and **settle** it, and answers `200` with the receipt and `PAYMENT-RESPONSE`. |
 | `GET` or `POST /claim` + `X-PAYMENT` (or `PAYMENT-SIGNATURE`) carrying a **settled transaction hash** | The agent paid by plain transfer: the worker verifies it **statelessly on Base RPC** (below) and answers with the receipt. |
-| `GET`/`HEAD` `/.well-known/x402` | `200` JSON capability manifest per [draft-hawkins-x402-dns-discovery-03](https://datatracker.ietf.org/doc/draft-hawkins-x402-dns-discovery/) (`kind: "resource-server"`): name, description, tags, icon, and the `/claim` resource with its live price, network, asset, `payTo` and `accepts[]`, plus docs/ledger/state links. Never a `402` — the `402` belongs to `/claim`. Without a readable `state.json` it still answers `200`, with `price: null`. |
+| `GET`/`HEAD` `/.well-known/x402` | `200` JSON capability manifest per [draft-hawkins-x402-dns-discovery-03](https://datatracker.ietf.org/doc/draft-hawkins-x402-dns-discovery/) (`kind: "resource-server"`): name, description, tags, icon, `contact`, `updated`, and the `/claim` resource with its network, asset and `payTo`, plus docs/ledger/state/agent-card links. **Static by design** (no price, no `state.json` read): the live price is in the `402` `PAYMENT-REQUIRED` challenge and `state.json`. Never a `402`. |
 | `GET /.well-known/agent-card.json` | An A2A-style agent card: name, skill, and the x402 / state / ledger endpoints. |
 | `GET /healthz` | `{"ok":true}` |
 | `GET /` | `302` → <https://thefirstwall.ai> |
@@ -342,6 +342,29 @@ BASE_URL=http://127.0.0.1:8787 ./test/dryrun.sh
 node test/verify_transfer.js              # auto-discovers a real transfer to pay_to
 node test/verify_transfer.js 0x<txHash>   # verify one specific transaction
 ```
+
+### Canonical integrity hashes
+
+This Worker is the source of truth for two documents that the ledger
+(`discovery/x402.json`, `discovery/agent-card.json`) and the web apex mirror
+byte-for-byte. Both are pure constants (the manifest is static by design: it carries
+no price and reads no `state.json`; the price lives in the `402` `PAYMENT-REQUIRED`
+challenge and `state.json`), so their bytes are deploy-stable. Mirrors pin these as
+`x402_manifest_sha256` / `agent_card_sha256`:
+
+| Document | sha256 of the exact served bytes |
+| --- | --- |
+| `/.well-known/x402` (`x402_manifest_sha256`) | `53d3120d465eb87ea7ed8863089e7d1ebb8b7923594e47d0c2c16a544fb2020b` |
+| `/.well-known/agent-card.json` (`agent_card_sha256`) | `f6af60d18b59bce88922003678d31a9b0e348f7b2f55236161d95c9b13394553` |
+
+Reproduce offline (no network): `npm test` runs `test/canonical-hashes.test.js`, which
+hashes the served bytes with `node:crypto` and compares them to these pins. Or against
+the live Worker: `curl -s https://x402.thefirstwall.ai/.well-known/x402 | shasum -a 256`.
+
+Bump rules: any byte change to a document fails that test. Update the pin there, this
+table, and the mirrors; bump `MANIFEST_UPDATED` for the manifest, or `CARD_VERSION` and
+`CARD_UPDATED_AT` (plus `test/fixtures/canonical-card-identity.json` if identity fields
+changed) for the card.
 
 ### Agent-card drift check (B-17)
 

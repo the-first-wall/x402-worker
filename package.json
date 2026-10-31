@@ -7,6 +7,6 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check:drift": "node scripts/check-card-drift.mjs",
-    "test": "node --test test/unit.test.js test/card-drift.test.js"
+    "test": "node --test test/unit.test.js test/card-drift.test.js test/canonical-hashes.test.js"
   }
 }
