@@ -715,3 +715,42 @@ test("Bazaar resource metadata stays inside the extension spec's limits", () => 
   // The extension and the resource must not drift apart.
   assert.equal(w.paymentRequired("https://x402.thefirstwall.ai/claim", { units: 1_000_000n }).extensions.bazaar.info.serviceName, resource.serviceName);
 });
+
+// --- B-52: the money path is never cacheable and varies on the payment headers ---
+
+const assertMoneyPath = (res, label) => {
+  assert.equal(res.headers.get("cache-control"), "no-store", `${label}: cache-control`);
+  const vary = (res.headers.get("vary") || "").split(",").map((s) => s.trim().toLowerCase());
+  assert.ok(vary.includes("payment-signature") && vary.includes("x-payment"), `${label}: vary=${vary}`);
+};
+
+test("B-52: every /claim response (402, 4xx, 5xx, 405) carries no-store + Vary on the payment headers", async () => {
+  const res = await worker.fetch(get(), env);
+  assert.equal(res.status, 402);
+  assertMoneyPath(res, "GET 402");
+  // existing CORS / expose-header behaviour is untouched
+  assert.equal(res.headers.get("access-control-allow-origin"), "*");
+  assert.equal(res.headers.get("access-control-expose-headers"), "PAYMENT-REQUIRED, PAYMENT-RESPONSE, X-PAYMENT-RESPONSE");
+  assert.ok(res.headers.get("PAYMENT-REQUIRED"));
+  assertMoneyPath(await worker.fetch(get({}, "HEAD"), env), "HEAD 402");
+  assertMoneyPath(await worker.fetch(get({}, "POST"), env), "POST 402");
+  assertMoneyPath(await worker.fetch(get({}, "DELETE"), env), "405");
+  const bad = await worker.fetch(get({ "X-PAYMENT": "not a proof" }), fenv);
+  assert.equal(bad.status, 400);
+  assertMoneyPath(bad, "400");
+  plan.stateStatus = 500;
+  const down = await worker.fetch(get(), env);
+  plan.stateStatus = null;
+  assert.equal(down.status, 503);
+  assertMoneyPath(down, "503");
+  // discovery documents keep their own public caching
+  const m = await worker.fetch(new Request("https://x.test/.well-known/x402"), env);
+  assert.equal(m.headers.get("cache-control"), "public, max-age=60");
+  assert.equal(m.headers.get("vary"), null);
+});
+
+test("B-52: the paid 200 receipt through the router is no-store + Vary too", async () => {
+  const res = await worker.fetch(post(), env);
+  assert.equal(res.status, 200);
+  assertMoneyPath(res, "200");
+});
