@@ -232,6 +232,19 @@ function json(body, status, headers) {
     },
   });
 }
+// B-52: the money path (/claim) must never be cached by a CDN or browser, and
+// anything that survives must key on the payment headers. Applied to every
+// /claim response (402 challenge, paid 200, 4xx, 5xx); stateless, no bindings.
+const MONEY_VARY = ["PAYMENT-SIGNATURE", "X-PAYMENT"];
+function moneyPath(res) {
+  const seen = new Set();
+  const vary = [...(res.headers.get("vary") || "").split(","), ...MONEY_VARY]
+    .map((v) => v.trim())
+    .filter((v) => v && !seen.has(v.toLowerCase()) && seen.add(v.toLowerCase()));
+  res.headers.set("cache-control", "no-store");
+  res.headers.set("vary", vary.join(", "));
+  return res;
+}
 function cfg(env, key, fallback) {
   return (env && env[key]) || fallback;
 }
@@ -1430,9 +1443,9 @@ export default {
 
     // The paid resource.
     if (url.pathname === "/claim") {
-      if (method === "HEAD") return respondPaymentRequired(env, resourceUrl, Date.now(), true);
-      if (method === "GET" || method === "POST") return handlePaidClaim(request, env, resourceUrl);
-      return json({ error: "method not allowed" }, 405, { allow: "GET, HEAD, POST, OPTIONS" });
+      if (method === "HEAD") return moneyPath(await respondPaymentRequired(env, resourceUrl, Date.now(), true));
+      if (method === "GET" || method === "POST") return moneyPath(await handlePaidClaim(request, env, resourceUrl));
+      return moneyPath(json({ error: "method not allowed" }, 405, { allow: "GET, HEAD, POST, OPTIONS" }));
     }
 
     if (url.pathname === "/.well-known/agent-card.json") {
